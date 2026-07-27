@@ -24,8 +24,11 @@ from PyQt6.QtWidgets import (
 )
 
 from ..app import AppContext
+from ..clients import Pace5000Client, RubyPressureClient
 from ..models import ControllerSnapshot
+from .api_config_dialog import ApiConfigDialog
 from .live_plot import LivePlotWidget
+from .membrane_rate_panel import MembraneRatePanel
 from .tab_schedule import ScheduleTab
 from .tab_single_target import SingleTargetTab
 from .worker import ControllerWorker
@@ -43,7 +46,7 @@ def _format_status(snap: ControllerSnapshot) -> str:
         f"filtered={_fmt(snap.filtered_pressure_gpa)} GPa  slope={_fmt(snap.pressure_slope_gpa_s, '{:.5f}')} GPa/s  "
         f"membrane={_fmt(snap.membrane_setpoint_mpa, '{:.4f}')}/{_fmt(snap.membrane_actual_mpa, '{:.4f}')} MPa (set/act)  "
         f"supply={_fmt(snap.source_pressure_positive_mpa, '{:.4f}')} MPa  "
-        f"max rate={rate}  safety={snap.safety_level}"
+        f"max rate={rate}  gas rate={_fmt(snap.membrane_rate_mpa_per_min, '{:.3f}')} MPa/min  safety={snap.safety_level}"
         f"{f' [{reasons}]' if reasons else ''}"
         f"{'  MANUAL-PAUSE' if snap.manual_pause else ''}"
         f"{f'  LOGGING ERROR: {snap.logging_error}' if snap.logging_error else ''}"
@@ -56,6 +59,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PressureKeeper")
         self._ctx = ctx
         self._controller = ctx.controller
+
+        self.configure_api_action = self.menuBar().addAction("Configure API")
+        self.configure_api_action.triggered.connect(self._on_configure_api)
+        if not (isinstance(ctx.ruby, RubyPressureClient) and isinstance(ctx.membrane, Pace5000Client)):
+            # --sim mode: ctx.ruby/ctx.membrane are simulator objects with no
+            # host/port/key to configure.
+            self.configure_api_action.setEnabled(False)
+            self.configure_api_action.setToolTip("Not available in simulator mode")
 
         self.live_plot = LivePlotWidget()
         self.tab1 = SingleTargetTab(self._controller)
@@ -70,6 +81,14 @@ class MainWindow(QMainWindow):
         tabs_policy = self.tabs.sizePolicy()
         tabs_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         self.tabs.setSizePolicy(tabs_policy)
+
+        # A small section below the tabs, independent of which tab is active,
+        # for the gas-side slew rate -- unlike tab1/tab2 it is never locked
+        # while a schedule runs (see _on_schedule_running_changed).
+        self.membrane_rate_panel = MembraneRatePanel(self._controller)
+        rate_panel_policy = self.membrane_rate_panel.sizePolicy()
+        rate_panel_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self.membrane_rate_panel.setSizePolicy(rate_panel_policy)
 
         self.start_btn = QPushButton("Start Control")
         self.start_btn.setStyleSheet("background-color:#22c55e; color:white; font-weight:bold;")
@@ -98,9 +117,13 @@ class MainWindow(QMainWindow):
             controls_row.addWidget(w)
         controls_row.addWidget(self.status_label, 1)
 
+        right_column = QVBoxLayout()
+        right_column.addWidget(self.tabs)
+        right_column.addWidget(self.membrane_rate_panel)
+
         columns = QHBoxLayout()
         columns.addWidget(self.live_plot, 7)
-        columns.addWidget(self.tabs, 3)
+        columns.addLayout(right_column, 3)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -119,8 +142,15 @@ class MainWindow(QMainWindow):
         self.start_btn.setText("Running")
         for w in (self.pause_btn, self.resume_btn, self.abort_btn, self.reset_btn):
             w.setEnabled(True)
+        # Repointing a client at a different device mid-control would do so
+        # without the safety supervisor ever having characterized it.
+        self.configure_api_action.setEnabled(False)
         self.status_label.setText("control loop starting...")
         self.worker.start()
+
+    def _on_configure_api(self) -> None:
+        dialog = ApiConfigDialog(self._ctx.ruby, self._ctx.membrane, parent=self)
+        dialog.exec()
 
     def _on_schedule_running_changed(self, running: bool) -> None:
         self.tabs.setTabEnabled(0, not running)

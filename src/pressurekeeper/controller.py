@@ -69,6 +69,7 @@ class OneSidedPressureController:
         self.state = ControlState.APPROACH
         self.user_target_gpa = config.control.default_target_pressure_gpa or 0.0
         self._max_compression_rate_gpa_per_min = config.approach.max_compression_rate_gpa_per_min
+        self._membrane_rate_mpa_per_min = config.pace5000_api.default_rate_mpa_per_min
 
         self._membrane_status: MembraneStatus | None = None
         self._membrane_status_fresh_this_tick = False
@@ -181,6 +182,45 @@ class OneSidedPressureController:
             )
         with self._lock:
             self._max_compression_rate_gpa_per_min = gpa_per_min
+
+    @property
+    def membrane_rate_mpa_per_min(self) -> float:
+        return self._membrane_rate_mpa_per_min
+
+    def set_membrane_rate_mpa_per_min(self, mpa_per_min: float) -> None:
+        """Operator-adjustable slew rate sent to the PACE5000 with every
+        set_pressure() command (i.e. how fast the membrane/gas pressure
+        setpoint itself is allowed to ramp). Independent of
+        max_compression_rate_gpa_per_min, which caps the resulting sample
+        pressure rise rather than the gas-side ramp.
+
+        A rate slower than config-load time assumed can silently break the
+        settle-detection invariant (see Configuration._region_ramp_time_
+        within_settle): the blackout clock could then expire while the
+        membrane is still physically mid-ramp toward the previous step's
+        target, so this rejects any value that would reopen that gap for
+        the current gain_regions, exactly as the config loader would.
+        """
+        if not math.isfinite(mpa_per_min) or mpa_per_min <= 0:
+            raise ValueError(
+                f"membrane_rate_mpa_per_min must be finite and > 0 (got {mpa_per_min!r})"
+            )
+        offending = self._cfg.regions_exceeding_ramp_time_budget(mpa_per_min)
+        if offending:
+            rate_mpa_per_s = mpa_per_min / 60.0
+            bad = ", ".join(
+                f"[{r.sample_pressure_min_gpa}-{r.sample_pressure_max_gpa}) GPa: "
+                f"ramp time {r.max_membrane_step / rate_mpa_per_s:.1f}s > "
+                f"minimum_settle_time_s={r.minimum_settle_time_s}"
+                for r in offending
+            )
+            raise ValueError(
+                f"membrane_rate_mpa_per_min={mpa_per_min} means the largest step allowed in these "
+                f"regions would take longer to ramp than minimum_settle_time_s waits, so settle "
+                f"detection could fire before the membrane has physically arrived: {bad}"
+            )
+        with self._lock:
+            self._membrane_rate_mpa_per_min = mpa_per_min
 
     def pause(self, reason: str = "operator requested pause") -> None:
         # Deliberately not gated by self._lock: SafetySupervisor's own flag
@@ -687,6 +727,7 @@ class OneSidedPressureController:
             "safe_gain": safe_gain,
             "requested_sample_step_gpa": requested_sample_step,
             "membrane_step_mpa": membrane_step,
+            "membrane_rate_mpa_per_min": self._membrane_rate_mpa_per_min,
             "region_min_gpa": region.sample_pressure_min_gpa,
             "region_max_gpa": region.sample_pressure_max_gpa,
             "source_pressure_positive_mpa": source_pressure,
@@ -724,7 +765,7 @@ class OneSidedPressureController:
         )
 
         try:
-            self._membrane.set_pressure(new_setpoint, self._cfg.pace5000_api.default_rate_mpa_per_min)
+            self._membrane.set_pressure(new_setpoint, self._membrane_rate_mpa_per_min)
         except MembraneCommError as e:
             # The write may have applied on the device even though we never
             # got the HTTP response back. Commit the same bookkeeping a
@@ -951,6 +992,7 @@ class OneSidedPressureController:
             safety_level=verdict.level,
             safety_reasons=tuple(e.code for e in verdict.events),
             max_compression_rate_gpa_per_min=self._max_compression_rate_gpa_per_min,
+            membrane_rate_mpa_per_min=self._membrane_rate_mpa_per_min,
             source_pressure_positive_mpa=(
                 self._membrane_status.source_pressure_positive_mpa
                 if self._membrane_status

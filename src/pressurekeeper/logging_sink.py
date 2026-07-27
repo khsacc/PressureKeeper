@@ -43,13 +43,13 @@ _TICK_FIELDS = [
     "membrane_setpoint_mpa", "membrane_actual_mpa",
     "safe_gain", "measurement_std_gpa", "measurement_r2", "estimator_valid",
     "manual_pause", "safety_level", "safety_reasons", "last_command_reason",
-    "max_compression_rate_gpa_per_min", "source_pressure_positive_mpa",
+    "max_compression_rate_gpa_per_min", "membrane_rate_mpa_per_min", "source_pressure_positive_mpa",
     "logging_error",
 ]
 
 _COMMAND_FIELDS = [
     "t_mono", "t_wall", "step_id", "reason",
-    "membrane_pressure_before", "membrane_pressure_after", "membrane_step_mpa",
+    "membrane_pressure_before", "membrane_pressure_after", "membrane_step_mpa", "membrane_rate_mpa_per_min",
     "sample_pressure_before", "filtered_pressure_gpa", "sizing_pressure_gpa", "pressure_slope_gpa_s",
     "predicted_pressure_gpa", "control_target_gpa", "predicted_error_gpa",
     "gain_source", "estimated_gain", "gain_uncertainty", "safe_gain",
@@ -124,6 +124,7 @@ class DataLogger:
             "safety_reasons": ";".join(snap.safety_reasons),
             "last_command_reason": snap.last_command_reason,
             "max_compression_rate_gpa_per_min": snap.max_compression_rate_gpa_per_min,
+            "membrane_rate_mpa_per_min": snap.membrane_rate_mpa_per_min,
             "source_pressure_positive_mpa": snap.source_pressure_positive_mpa,
             "logging_error": snap.logging_error,
         })
@@ -137,6 +138,7 @@ class DataLogger:
             "membrane_pressure_before": step.membrane_pressure_before,
             "membrane_pressure_after": step.membrane_pressure_after,
             "membrane_step_mpa": d.get("membrane_step_mpa"),
+            "membrane_rate_mpa_per_min": d.get("membrane_rate_mpa_per_min"),
             "sample_pressure_before": step.sample_pressure_before,
             "filtered_pressure_gpa": d.get("filtered_pressure_gpa"),
             "sizing_pressure_gpa": d.get("sizing_pressure_gpa"),

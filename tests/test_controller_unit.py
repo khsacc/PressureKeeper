@@ -327,6 +327,58 @@ def test_set_max_compression_rate_rejects_non_positive(tmp_path):
             pass
 
 
+def test_set_membrane_rate_mpa_per_min_updates_and_is_used_on_next_command(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    assert controller.membrane_rate_mpa_per_min == 24.0  # make_config()'s default_rate_mpa_per_min
+
+    controller.set_membrane_rate_mpa_per_min(30.0)
+    assert controller.membrane_rate_mpa_per_min == 30.0
+
+    seen_rates: list[float] = []
+    original_set_pressure = membrane.set_pressure
+
+    def spying_set_pressure(pressure_mpa, rate_mpa_per_min):
+        seen_rates.append(rate_mpa_per_min)
+        original_set_pressure(pressure_mpa, rate_mpa_per_min)
+
+    membrane.set_pressure = spying_set_pressure
+    ruby.push(0.0, n=5)
+    snap = tick(controller, clock, n=5)
+    logger.close()
+
+    assert seen_rates, "expected at least one set_pressure command"
+    assert all(r == 30.0 for r in seen_rates)
+    assert snap.membrane_rate_mpa_per_min == 30.0
+
+
+def test_set_membrane_rate_mpa_per_min_rejects_non_positive(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    logger.close()
+    for bad in (0.0, -1.0):
+        try:
+            controller.set_membrane_rate_mpa_per_min(bad)
+            assert False, f"expected ValueError for membrane_rate_mpa_per_min={bad}"
+        except ValueError:
+            pass
+
+
+def test_set_membrane_rate_mpa_per_min_rejects_settle_invariant_violation(tmp_path):
+    # make_config()'s region 0 has max_membrane_step=1.0, minimum_settle_time_s=3.0
+    # -- a rate slower than 1.0/3.0*60 = 20.0 MPa/min would let that region's
+    # largest step still be mid-ramp when the settle blackout clock expires,
+    # exactly the invariant Configuration._region_ramp_time_within_settle
+    # enforces at config-load time for the configured default.
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    logger.close()
+    original = controller.membrane_rate_mpa_per_min
+    try:
+        controller.set_membrane_rate_mpa_per_min(10.0)
+        assert False, "expected ValueError for a rate that breaks the settle-time invariant"
+    except ValueError:
+        pass
+    assert controller.membrane_rate_mpa_per_min == original, "rejected rate must not partially apply"
+
+
 def test_manual_pause_stops_membrane_control_mode_immediately(tmp_path):
     # pause()'s emergency-stop attempt runs synchronously, independent of
     # step() -- control_mode should already be off before any tick.

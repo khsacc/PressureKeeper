@@ -180,6 +180,32 @@ class Pace5000Client:
     def close(self) -> None:
         self._session.close()
 
+    @property
+    def base_url(self) -> str:
+        return self._cfg.base_url
+
+    @property
+    def api_key(self) -> str | None:
+        return self._cfg.api_key
+
+    def update_connection(self, *, base_url: str, api_key: str | None) -> None:
+        """Repoint this client at a different host/key at runtime.
+
+        Only for the GUI's "Configure API" dialog, and only meant to be
+        called before the control loop has started -- swapping endpoints
+        mid-control would point the safety-checked loop at a different
+        physical PACE5000 without warning. `set_control_mode()`/
+        `read_status()` build their headers fresh from `self._cfg` on every
+        call, but `_post()` (used by `set_pressure()`) relies on the
+        session's default headers, so those must be refreshed here too.
+        """
+        self._cfg.base_url = base_url
+        self._cfg.api_key = api_key
+        if api_key:
+            self._session.headers["X-API-Key"] = api_key
+        else:
+            self._session.headers.pop("X-API-Key", None)
+
 
 def _optional_float(value: object) -> float | None:
     if value is None:

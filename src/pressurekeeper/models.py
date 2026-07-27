@@ -219,5 +219,6 @@ class ControllerSnapshot:
     safety_level: Literal["ok", "pause", "abort"]
     safety_reasons: tuple[str, ...] = ()
     max_compression_rate_gpa_per_min: float | None = None
+    membrane_rate_mpa_per_min: float | None = None
     source_pressure_positive_mpa: float | None = None
     logging_error: str | None = None

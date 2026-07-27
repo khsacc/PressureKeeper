@@ -159,6 +159,26 @@ class RubyPressureClient:
     def close(self) -> None:
         self._session.close()
 
+    @property
+    def base_url(self) -> str:
+        return self._cfg.base_url
+
+    @property
+    def api_key(self) -> str:
+        return self._cfg.api_key
+
+    def update_connection(self, *, base_url: str, api_key: str) -> None:
+        """Repoint this client at a different host/key at runtime.
+
+        Only for the GUI's "Configure API" dialog, and only meant to be
+        called before the control loop has started -- swapping endpoints
+        mid-control would point the safety-checked loop at a different
+        physical spectrometer PC without warning.
+        """
+        self._cfg.base_url = base_url
+        self._cfg.api_key = api_key
+        self._session.headers["X-API-Key"] = api_key
+
 
 def _optional_float(value: object) -> float | None:
     if value is None:

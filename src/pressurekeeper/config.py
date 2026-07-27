@@ -285,6 +285,23 @@ class Configuration(BaseModel):
             )
         return self
 
+    def regions_exceeding_ramp_time_budget(self, rate_mpa_per_min: float) -> list[GainRegion]:
+        """Gain regions whose largest allowed step would take longer to
+        physically ramp at `rate_mpa_per_min` than minimum_settle_time_s
+        waits -- shared between _region_ramp_time_within_settle (checked
+        against the configured default at load time) and
+        OneSidedPressureController.set_membrane_rate_mpa_per_min (checked
+        against an operator-entered value at runtime), since both must
+        preserve the same invariant: see that validator for why.
+        """
+        rate_mpa_per_s = rate_mpa_per_min / 60.0
+        if rate_mpa_per_s <= 0:
+            return []
+        return [
+            r for r in self.gain_regions
+            if (r.max_membrane_step / rate_mpa_per_s) > r.minimum_settle_time_s + 1e-9
+        ]
+
     @model_validator(mode="after")
     def _region_ramp_time_within_settle(self) -> "Configuration":
         # A region's largest allowed step must finish ramping (at the rate we
@@ -295,14 +312,10 @@ class Configuration(BaseModel):
         # settle (the sample hasn't felt the rest of the step yet either), and
         # the next step's baseline (the commanded setpoint) stacks on top of a
         # setpoint the membrane hasn't reached yet.
-        rate_mpa_per_s = self.pace5000_api.default_rate_mpa_per_min / 60.0
-        if rate_mpa_per_s <= 0:
-            return self
-        offending = [
-            r for r in self.gain_regions
-            if (r.max_membrane_step / rate_mpa_per_s) > r.minimum_settle_time_s + 1e-9
-        ]
+        rate = self.pace5000_api.default_rate_mpa_per_min
+        offending = self.regions_exceeding_ramp_time_budget(rate)
         if offending:
+            rate_mpa_per_s = rate / 60.0
             bad = ", ".join(
                 f"[{r.sample_pressure_min_gpa}-{r.sample_pressure_max_gpa}) GPa: "
                 f"ramp time {r.max_membrane_step / rate_mpa_per_s:.1f}s > "
@@ -310,7 +323,7 @@ class Configuration(BaseModel):
                 for r in offending
             )
             raise ValueError(
-                f"pace5000_api.default_rate_mpa_per_min ({self.pace5000_api.default_rate_mpa_per_min}) "
+                f"pace5000_api.default_rate_mpa_per_min ({rate}) "
                 f"means the largest step allowed in these regions takes longer to ramp than "
                 f"minimum_settle_time_s waits, so settle detection could fire before the membrane "
                 f"has physically arrived: {bad}"
