@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -64,6 +65,11 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self.tab1, "Single Target")
         self.tabs.addTab(self.tab2, "Schedule")
+        # The schedule tab has wide control rows, whose size hint would
+        # otherwise override the column stretch factors and widen this pane.
+        tabs_policy = self.tabs.sizePolicy()
+        tabs_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self.tabs.setSizePolicy(tabs_policy)
 
         self.start_btn = QPushButton("Start Control")
         self.start_btn.setStyleSheet("background-color:#22c55e; color:white; font-weight:bold;")

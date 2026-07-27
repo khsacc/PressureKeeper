@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDoubleSpinBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -63,7 +64,7 @@ class ScheduleTab(QWidget):
         self.target_spin.setRange(0.0, self._max_gpa)
         self.target_spin.setSingleStep(0.01)
         self.target_spin.setSuffix(" GPa")
-        add_target_btn = QPushButton("Add Set-Pressure Step")
+        add_target_btn = QPushButton("Add Set-Pressure\nStep")
         add_target_btn.clicked.connect(self._add_set_pressure_step)
 
         self.wait_spin = QDoubleSpinBox()
@@ -72,18 +73,18 @@ class ScheduleTab(QWidget):
         self.wait_spin.setSingleStep(1.0)
         self.wait_spin.setSuffix(" min")
         self.wait_spin.setValue(10.0)
-        add_wait_btn = QPushButton("Add Wait Step")
+        add_wait_btn = QPushButton("Add Wait\nStep")
         add_wait_btn.clicked.connect(self._add_wait_step)
 
-        add_row = QHBoxLayout()
-        add_row.addWidget(self.target_spin)
-        add_row.addWidget(add_target_btn)
-        add_row.addSpacing(20)
-        add_row.addWidget(self.wait_spin)
-        add_row.addWidget(add_wait_btn)
-        add_row.addStretch(1)
+        add_grid = QGridLayout()
+        add_grid.addWidget(self.target_spin, 0, 0)
+        add_grid.addWidget(add_target_btn, 0, 1)
+        add_grid.addWidget(self.wait_spin, 1, 0)
+        add_grid.addWidget(add_wait_btn, 1, 1)
+        add_grid.setColumnStretch(0, 1)
+        add_grid.setColumnStretch(1, 1)
 
-        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn = QPushButton("Remove\nSelected")
         self.remove_btn.clicked.connect(self._remove_selected)
         self.up_btn = QPushButton("Move Up")
         self.up_btn.clicked.connect(lambda: self._move(-1))
@@ -96,10 +97,12 @@ class ScheduleTab(QWidget):
         self.save_btn = QPushButton("Save...")
         self.save_btn.clicked.connect(self._save)
 
-        edit_row = QHBoxLayout()
-        for w in (self.remove_btn, self.up_btn, self.down_btn, self.clear_btn, self.load_btn, self.save_btn):
-            edit_row.addWidget(w)
-        edit_row.addStretch(1)
+        edit_grid = QGridLayout()
+        edit_buttons = (self.remove_btn, self.up_btn, self.down_btn, self.clear_btn, self.load_btn, self.save_btn)
+        for i, widget in enumerate(edit_buttons):
+            edit_grid.addWidget(widget, i // 3, i % 3)
+        for column in range(3):
+            edit_grid.setColumnStretch(column, 1)
         self._edit_widgets = [
             self.remove_btn, self.up_btn, self.down_btn, self.clear_btn, self.load_btn,
             self.target_spin, add_target_btn, self.wait_spin, add_wait_btn,
@@ -120,8 +123,8 @@ class ScheduleTab(QWidget):
 
         outer = QVBoxLayout(self)
         outer.addWidget(self.table)
-        outer.addLayout(add_row)
-        outer.addLayout(edit_row)
+        outer.addLayout(add_grid)
+        outer.addLayout(edit_grid)
         outer.addLayout(run_row)
         outer.addWidget(self.status_label)
 

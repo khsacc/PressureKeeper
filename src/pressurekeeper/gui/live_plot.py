@@ -43,7 +43,7 @@ class LivePlotWidget(QWidget):
         layout.addWidget(glw)
 
         self.sample_plot = glw.addPlot(row=0, col=0, title="Sample pressure (ruby)")
-        self.sample_plot.setLabel("left", "GPa")
+        self.sample_plot.setLabel("left", "Sample pressure", "GPa")
         self.sample_plot.setLabel("bottom", "elapsed time", "s")
         self.sample_plot.getAxis("left").enableAutoSIPrefix(False)
         self.sample_plot.showGrid(x=True, y=True, alpha=0.2)
@@ -54,7 +54,7 @@ class LivePlotWidget(QWidget):
         )
 
         self.membrane_plot = glw.addPlot(row=0, col=1, title="Membrane (gas) pressure")
-        self.membrane_plot.setLabel("left", "MPa")
+        self.membrane_plot.setLabel("left", "Gas pressure", "MPa")
         self.membrane_plot.setLabel("bottom", "elapsed time", "s")
         self.membrane_plot.getAxis("left").enableAutoSIPrefix(False)
         self.membrane_plot.showGrid(x=True, y=True, alpha=0.2)
@@ -64,8 +64,8 @@ class LivePlotWidget(QWidget):
         self.membrane_act_curve = self.membrane_plot.plot(pen=pg.mkPen("#a855f7", width=2), name="actual")
 
         self.corr_plot = glw.addPlot(row=0, col=2, title="Sample vs Membrane pressure")
-        self.corr_plot.setLabel("left", "sample pressure", "GPa")
-        self.corr_plot.setLabel("bottom", "membrane pressure", "MPa")
+        self.corr_plot.setLabel("left", "Sample pressure", "GPa")
+        self.corr_plot.setLabel("bottom", "Membrane pressure", "MPa")
         self.corr_plot.getAxis("left").enableAutoSIPrefix(False)
         self.corr_plot.getAxis("bottom").enableAutoSIPrefix(False)
         self.corr_plot.showGrid(x=True, y=True, alpha=0.2)
