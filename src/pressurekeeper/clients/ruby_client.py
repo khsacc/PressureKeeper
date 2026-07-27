@@ -50,9 +50,31 @@ class RubyPressureClient:
 
     @staticmethod
     def _effective_timeout(config: RubyApiConfig) -> float:
+        """Read timeout for one /acquire/pressure round trip.
+
+        `exposure_time_s * accumulations` is only the camera's dwell time --
+        FluoraPressee's handler also pays for per-frame readout dead time, the
+        peak fit itself, and however long its Qt event loop takes to service
+        the acquisition on the GUI thread (see that repo's `gui_bridge.py`,
+        which allows up to 60 s per acquisition as an outer safety valve
+        against a stuck GUI thread, not a typical turnaround). A too-tight
+        budget here makes a slow-but-working acquisition indistinguishable
+        from a dead link, tripping `ruby_api_unreachable` even though
+        FluoraPressee genuinely completed the measurement.
+
+        Deliberately not stretched all the way to FluoraPressee's 60 s
+        ceiling: a single stuck read would then block the control loop for a
+        full minute, at odds with this app's own `max_stale_sample_s` /
+        `ruby_error_pause_after_s` design intent (single-digit seconds). If a
+        site's real readout/fit overhead exceeds this margin, raise
+        `ruby_api.timeout_s` directly rather than stretching this further.
+        """
         acq = config.acquisition
-        exposure_budget = (acq.exposure_time_s or 0.0) * (acq.accumulations or 1) + 2.0
-        return max(config.timeout_s, exposure_budget)
+        accumulations = acq.accumulations or 1
+        exposure_budget = (acq.exposure_time_s or 0.0) * accumulations
+        per_frame_readout_margin = 0.5 * accumulations
+        fit_and_scheduling_margin = 5.0
+        return max(config.timeout_s, exposure_budget + per_frame_readout_margin + fit_and_scheduling_margin)
 
     def read(self) -> RubyPressureSample:
         try:

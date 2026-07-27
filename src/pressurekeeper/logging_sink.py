@@ -15,6 +15,7 @@ surface, since callers only depend on this class's public API.
 from __future__ import annotations
 
 import csv
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,18 @@ from typing import TextIO
 
 from .config import LoggingConfig
 from .models import ControllerSnapshot, SafetyEvent, StateTransition, StepRecord
+
+
+def _echo_to_terminal(tag: str, code: str, message: str) -> None:
+    # CSV rows are the audit trail, but they're silent until someone opens the
+    # file after the fact -- an operator watching the terminal next to the GUI
+    # (which only ever surfaces the bare event *code*, see main_window.py)
+    # needs the actual message live to tell a real device fault apart from,
+    # e.g., a client-side timeout that fired while the remote acquisition
+    # actually succeeded.
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {tag:<5s} {code}: {message}", file=sys.stderr, flush=True)
+
 
 _TICK_FIELDS = [
     "t_mono", "t_wall", "state",
@@ -166,6 +179,8 @@ class DataLogger:
             "from_state": "", "to_state": "",
         })
         self._maybe_flush()
+        if event.severity != "info":
+            _echo_to_terminal(event.severity.upper(), event.code, event.message)
 
     def log_transition(self, transition: StateTransition) -> None:
         self._event_w.writerow({
@@ -174,6 +189,7 @@ class DataLogger:
             "from_state": transition.from_state.value, "to_state": transition.to_state.value,
         })
         self._maybe_flush()
+        _echo_to_terminal("STATE", f"{transition.from_state.value}->{transition.to_state.value}", transition.reason)
 
     def _maybe_flush(self) -> None:
         self._n_since_flush += 1

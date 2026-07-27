@@ -123,4 +123,14 @@ echo   Test suite:
 echo     .venv\Scripts\pytest -q
 echo.
 
+if "%INSTALL_GUI%"=="1" (
+    echo   GUI ^(simulator mode^):
+    echo     .venv\Scripts\pressurekeeper-gui --config config\default.yaml --sim --target 1.0
+    echo.
+) else (
+    echo   GUI extras were not installed. Re-run 'setup.bat --gui' to add them, then:
+    echo     .venv\Scripts\pressurekeeper-gui --config config\default.yaml --sim --target 1.0
+    echo.
+)
+
 endlocal

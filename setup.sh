@@ -99,3 +99,17 @@ Setup complete. From now on, a single command is enough:
     .venv/bin/pytest -q
 
 EOF
+
+if [ "$INSTALL_GUI" -eq 1 ]; then
+    cat <<'EOF'
+  GUI (simulator mode):
+    .venv/bin/pressurekeeper-gui --config config/default.yaml --sim --target 1.0
+
+EOF
+else
+    cat <<'EOF'
+  GUI extras were not installed. Re-run './setup.sh --gui' to add them, then:
+    .venv/bin/pressurekeeper-gui --config config/default.yaml --sim --target 1.0
+
+EOF
+fi
