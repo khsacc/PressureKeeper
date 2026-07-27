@@ -1,18 +1,18 @@
 # PressureKeeper
 
 One-sided, predictive, stepwise pressure control for a membrane-driven
-diamond anvil cell (DAC).
+diamond anvil cell (mDAC).
 
 - **Actuator**: Druck PACE5000 controlling He membrane pressure (max 6 MPa),
-  accessed via the HTTP API of the existing control app at
-  `PF_BL18C_control/bl18c_controller/apps/PACE5000` (`apps/PACE5000/app.py --api`).
-  This project never talks to the PACE5000 hardware directly — it only calls
-  that app's API, which owns the serial link and device-level safety checks.
+  accessed via the HTTP API of a separate existing PACE5000 control app
+  (started with its `--api` flag). This project never talks to the PACE5000
+  hardware directly — it only calls that app's API, which owns the serial
+  link and device-level safety checks.
 - **Feedback**: sample pressure from ruby fluorescence, read via the HTTP API
-  of `lab_andor/FluoraPressee`'s spectroscopy control app (typically running
-  on a different PC), at up to ~4 Hz.
+  of a separate spectroscopy control app (typically running on a different
+  PC), at up to ~4 Hz.
 
-Because membrane deformation is largely irreversible, active pressure
+Because pressure generation in DACs is largely irreversible, active pressure
 control **only ever raises actual membrane pressure**. The sole setpoint
 decrease is a safe rebase while the output is already in Measure; it cannot
 drive the membrane downward. This is not a PID loop — it is a
@@ -44,7 +44,7 @@ pressurekeeper/
   logging_sink.py          DataLogger: CSV time series (ticks / commands / steps / events)
   clients/
     pace5000_client.py      HTTP client for the PACE5000 control app's API
-    ruby_client.py            HTTP client for the FluoraPressee ruby API
+    ruby_client.py            HTTP client for the ruby-pressure control app's API
   sim/
     simulator.py               offline physics simulator (same Protocols as real clients)
   app.py             wiring: Configuration -> fully assembled controller (real or simulated)
@@ -210,8 +210,8 @@ See `config/default.yaml` (documented inline). All device-specific numbers
 there; nothing device-specific is hardcoded. Fields marked `SITE-SPECIFIC`
 must be reviewed before use, in particular:
 
-- `ruby_api.base_url` / `ruby_api.api_key` (FluoraPressee's host + the key
-  from its `fluora_pressee_api_key.json`)
+- `ruby_api.base_url` / `ruby_api.api_key` (the ruby control app's host and
+  the API key it issues)
 - `ruby_api.acquisition.*` (fitting/exposure parameters, ruby zero-pressure
   peak position, pressure scale)
 - `safety.max_sample_pressure_gpa` (your experiment's planned ceiling)
