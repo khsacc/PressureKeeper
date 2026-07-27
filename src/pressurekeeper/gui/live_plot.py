@@ -1,8 +1,11 @@
 """Common Live Plot: sample (ruby) pressure and membrane (gas) pressure vs
-time, shared by both tabs. Two X-linked pyqtgraph plots (different units, so
+time, plus sample-vs-membrane pressure, shared by both tabs. The two
+vs-time plots are X-linked pyqtgraph plots side by side (different units, so
 a shared Y-axis would distort one series) inside a rolling time window --
 plotting a full multi-hour run at ~4 Hz point-for-point gets slow, and the
-full-resolution data is already on disk in ticks.csv for later analysis.
+full-resolution data is already on disk in ticks.csv for later analysis. The
+third plot re-uses that same rolling window, just axed by membrane pressure
+instead of time, to show the sample/membrane response curve.
 """
 from __future__ import annotations
 
@@ -41,6 +44,8 @@ class LivePlotWidget(QWidget):
 
         self.sample_plot = glw.addPlot(row=0, col=0, title="Sample pressure (ruby)")
         self.sample_plot.setLabel("left", "GPa")
+        self.sample_plot.setLabel("bottom", "elapsed time", "s")
+        self.sample_plot.getAxis("left").enableAutoSIPrefix(False)
         self.sample_plot.showGrid(x=True, y=True, alpha=0.2)
         self.sample_plot.addLegend(offset=(10, 10))
         self.sample_curve = self.sample_plot.plot(pen=pg.mkPen("#3b82f6", width=2), name="filtered")
@@ -48,15 +53,25 @@ class LivePlotWidget(QWidget):
             pen=pg.mkPen("#94a3b8", width=1, style=Qt.PenStyle.DashLine), name="target"
         )
 
-        glw.nextRow()
-        self.membrane_plot = glw.addPlot(row=1, col=0, title="Membrane (gas) pressure")
+        self.membrane_plot = glw.addPlot(row=0, col=1, title="Membrane (gas) pressure")
         self.membrane_plot.setLabel("left", "MPa")
         self.membrane_plot.setLabel("bottom", "elapsed time", "s")
+        self.membrane_plot.getAxis("left").enableAutoSIPrefix(False)
         self.membrane_plot.showGrid(x=True, y=True, alpha=0.2)
         self.membrane_plot.addLegend(offset=(10, 10))
         self.membrane_plot.setXLink(self.sample_plot)
         self.membrane_set_curve = self.membrane_plot.plot(pen=pg.mkPen("#94a3b8", width=1), name="setpoint")
         self.membrane_act_curve = self.membrane_plot.plot(pen=pg.mkPen("#a855f7", width=2), name="actual")
+
+        self.corr_plot = glw.addPlot(row=0, col=2, title="Sample vs Membrane pressure")
+        self.corr_plot.setLabel("left", "sample pressure", "GPa")
+        self.corr_plot.setLabel("bottom", "membrane pressure", "MPa")
+        self.corr_plot.getAxis("left").enableAutoSIPrefix(False)
+        self.corr_plot.getAxis("bottom").enableAutoSIPrefix(False)
+        self.corr_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.corr_trace = self.corr_plot.plot(pen=pg.mkPen("#3b82f6", width=1))
+        self.corr_current = pg.ScatterPlotItem(size=10, brush=pg.mkBrush("#ef4444"), pen=None)
+        self.corr_plot.addItem(self.corr_current)
 
     def add_snapshot(self, snap: ControllerSnapshot) -> None:
         if self._t0 is None:
@@ -78,10 +93,19 @@ class LivePlotWidget(QWidget):
             self._membrane_act.popleft()
 
         xs = list(self._t)
-        self.sample_curve.setData(xs, list(self._sample))
+        sample_ys = list(self._sample)
+        membrane_act_xs = list(self._membrane_act)
+        self.sample_curve.setData(xs, sample_ys)
         self.target_curve.setData(xs, list(self._target))
         self.membrane_set_curve.setData(xs, list(self._membrane_set))
-        self.membrane_act_curve.setData(xs, list(self._membrane_act))
+        self.membrane_act_curve.setData(xs, membrane_act_xs)
+
+        self.corr_trace.setData(membrane_act_xs, sample_ys)
+        last_x, last_y = membrane_act_xs[-1], sample_ys[-1]
+        if last_x == last_x and last_y == last_y:  # not NaN
+            self.corr_current.setData([last_x], [last_y])
+        else:
+            self.corr_current.setData([], [])
 
         color = _STATE_COLORS.get(snap.state.value, "#3b82f6")
         self.sample_plot.setTitle(f"Sample pressure (ruby) — <span style='color:{color}'>{snap.state.value}</span>")
@@ -93,6 +117,8 @@ class LivePlotWidget(QWidget):
         self._membrane_set.clear()
         self._membrane_act.clear()
         self._t0 = None
+        self.corr_trace.setData([], [])
+        self.corr_current.setData([], [])
 
 
 def _or_nan(value: float | None) -> float:

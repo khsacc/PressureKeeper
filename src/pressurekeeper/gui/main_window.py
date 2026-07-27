@@ -92,13 +92,16 @@ class MainWindow(QMainWindow):
             controls_row.addWidget(w)
         controls_row.addWidget(self.status_label, 1)
 
+        columns = QHBoxLayout()
+        columns.addWidget(self.live_plot, 7)
+        columns.addWidget(self.tabs, 3)
+
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.addWidget(self.live_plot, 3)
         layout.addLayout(controls_row)
-        layout.addWidget(self.tabs, 2)
+        layout.addLayout(columns, 1)
         self.setCentralWidget(central)
-        self.resize(1100, 850)
+        self.resize(1800, 800)
 
         self.worker = ControllerWorker(self._controller, poll_interval_s)
         self.worker.snapshot_ready.connect(self._on_snapshot)
