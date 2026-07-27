@@ -4,13 +4,12 @@ One-sided, predictive, stepwise pressure control for a membrane-driven
 diamond anvil cell (mDAC).
 
 - **Actuator**: Druck PACE5000 controlling He membrane pressure (max 6 MPa),
-  accessed via the HTTP API of a separate existing PACE5000 control app
+  accessed via the HTTP API of a separate existing PACE5000 control app, [PaceMaker](https://github.com/khsacc/PaceMaker)
   (started with its `--api` flag). This project never talks to the PACE5000
   hardware directly — it only calls that app's API, which owns the serial
   link and device-level safety checks.
 - **Feedback**: sample pressure from ruby fluorescence, read via the HTTP API
-  of a separate spectroscopy control app (typically running on a different
-  PC), at up to ~4 Hz.
+  of a separate spectroscopy control app, [FluoRaPressée](https://github.com/khsacc/FluoraPressee), at up to ~4 Hz.
 
 Because pressure generation in DACs is largely irreversible, active pressure
 control **only ever raises actual membrane pressure**. The sole setpoint
