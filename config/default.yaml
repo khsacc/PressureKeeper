@@ -11,32 +11,32 @@
 
 ruby_api:
   # SITE-SPECIFIC: hostname/IP of the PC running FluoraPressee.
-  base_url: "http://ruby-pc.local:8765"
+  base_url: "http://133.11.18.145:8765"
   # SITE-SPECIFIC: from FluoraPressee's fluora_pressee_api_key.json.
-  api_key: "REPLACE_WITH_FLUORAPRESSEE_API_KEY"
+  api_key: "bplEolmbhPQkQrODVtrOFIbQjA72ZEtg"
   timeout_s: 5.0
-  poll_interval_s: 0.25  # 4 Hz ceiling; do not set below 0.2 s
+  poll_interval_s: 0.5 # 4 Hz ceiling; do not set below 0.2 s
   acquisition:
     configuration_id: null       # null = use whatever configuration is currently active in FluoraPressee
     axis_mode: null              # axis_mode can only be set together with an explicit configuration_id
                                   # (FluoraPressee rejects axis_mode set while configuration_id is null)
     exposure_time_s: 0.1         # SITE-SPECIFIC: tune with accumulations to stay near 0.25 s/reading
     accumulations: 1
-    dark_mode: reuse_loaded
-    fit_function: "Pseudo Voigt"
-    fit_peak_count: 1
+    dark_mode: none
+    fit_function: "Moffat"
+    fit_peak_count: 2            # R1/R2 doublet (694.343/692.915 nm) -- 1 peak can't fit both, drags R2 down
     peak_sort_order: x_desc
     baseline_model: constant
     sensor: ruby
     pressure_scale: ruby_shen_2020   # SITE-SPECIFIC: match your lab's adopted ruby scale
-    zero_pressure_peak: 694.3        # SITE-SPECIFIC: R1 line position at zero pressure/current temperature
+    zero_pressure_peak: 694.281        # SITE-SPECIFIC: R1 line position at zero pressure/current temperature
     pressure_peak_index: 1
 
 pace5000_api:
   # Loopback default: this app + apps/PACE5000/app.py --api run on the same
   # PC as PACE5000 itself. Change if the PACE5000 control app runs elsewhere.
   base_url: "http://127.0.0.1:8765"
-  api_key: null              # only required if pace5000_api is bound to a non-loopback host
+  api_key: 8UzPKoc3wqCSE5Y1iNfNCaUWjfcoPacH              # only required if pace5000_api is bound to a non-loopback host
   timeout_s: 5.0
   status_poll_interval_s: 0.25
   default_rate_mpa_per_min: 5.0   # ramp rate used for every PACE5000 setpoint write
@@ -147,9 +147,9 @@ safety:
   max_consecutive_comm_errors: 3
   sample_jump_hard_gpa: 0.5
   max_consecutive_jump_flags: 3
-  setpoint_mismatch_tol_mpa: 0.05
+  setpoint_mismatch_tol_mpa: 0.03
   setpoint_mismatch_grace_s: 0.0   # a commanded/read-back mismatch PAUSEs on the first fresh status
-  max_setpoint_actual_gap_mpa: 1.0 # must be >= max_membrane_step_mpa_hard; larger active gaps PAUSE immediately
+  max_setpoint_actual_gap_mpa: 1.5 # must be >= max_membrane_step_mpa_hard; larger active gaps PAUSE immediately
   # Strict requirement is supply > setpoint. Increase this if the PACE5000
   # needs additional working headroom at your site.
   minimum_source_pressure_headroom_mpa: 0.0

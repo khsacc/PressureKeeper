@@ -324,24 +324,28 @@ class OneSidedPressureController:
                 else:
                     self._safety.on_membrane_status(now)
                     self._membrane_status_fresh_this_tick = True
-                    if (
-                        self._cfg.control.dry_run
-                        and status is not None
-                        and status.connected
-                    ):
-                        # Rehearsal mode must never toggle the real PACE5000
-                        # output.  Evaluate the state machine against our
-                        # simulated drive intent instead; otherwise a safely
-                        # measure-only real device reports control_mode=False,
-                        # permanently PAUSEs dry-run, and no would-be command
-                        # can ever be exercised/logged.
-                        status = replace(
-                            status,
-                            control_mode=self._dry_run_driving_believed,
-                        )
-                    self._membrane_status = status
             else:
                 status = self._membrane_status
+
+            if (
+                self._cfg.control.dry_run
+                and status is not None
+                and status.connected
+            ):
+                # Rehearsal mode must never toggle the real PACE5000 output.
+                # Evaluate the state machine against our simulated drive
+                # intent instead -- re-applied every tick, not only ticks
+                # with a fresh status poll: _dry_run_driving_believed can
+                # flip on any tick (_reconcile_membrane_drive runs every
+                # tick) while status polls are comparatively infrequent.
+                # Baking the override in only at poll time left a stale
+                # real control_mode=False cached in self._membrane_status
+                # between polls, spuriously tripping
+                # membrane_control_mode_disabled and abandoning a
+                # just-staged step on every rearm cycle.
+                status = replace(status, control_mode=self._dry_run_driving_believed)
+
+            self._membrane_status = status
 
             verdict = self._safety.evaluate(
                 self._estimator, status, now, extra_events,
