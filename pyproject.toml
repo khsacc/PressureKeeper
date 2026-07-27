@@ -1,0 +1,28 @@
+[project]
+name = "pressurekeeper"
+version = "0.1.0"
+description = "One-sided predictive pressure controller for a membrane-driven diamond anvil cell"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+gui = ["PyQt6>=6.6", "pyqtgraph>=0.13"]
+
+[project.scripts]
+pressurekeeper = "pressurekeeper.cli:main"
+pressurekeeper-gui = "pressurekeeper.gui.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

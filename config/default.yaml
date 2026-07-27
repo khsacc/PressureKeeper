@@ -1,0 +1,167 @@
+# PressureKeeper default configuration.
+#
+# All device-specific numbers live here — nothing device-specific is
+# hardcoded in the control logic. Values marked "SITE-SPECIFIC" below are
+# placeholders and MUST be reviewed/calibrated before live use; everything
+# else is a reasonable conservative starting point for a He-membrane DAC
+# with a 6 MPa membrane supply.
+#
+# Units (fixed throughout): sample pressure in GPa, membrane pressure in MPa,
+# time in seconds, gain in GPa/MPa.
+
+ruby_api:
+  # SITE-SPECIFIC: hostname/IP of the PC running FluoraPressee.
+  base_url: "http://ruby-pc.local:8765"
+  # SITE-SPECIFIC: from FluoraPressee's fluora_pressee_api_key.json.
+  api_key: "REPLACE_WITH_FLUORAPRESSEE_API_KEY"
+  timeout_s: 5.0
+  poll_interval_s: 0.25  # 4 Hz ceiling; do not set below 0.2 s
+  acquisition:
+    configuration_id: null       # null = use whatever configuration is currently active in FluoraPressee
+    axis_mode: null              # axis_mode can only be set together with an explicit configuration_id
+                                  # (FluoraPressee rejects axis_mode set while configuration_id is null)
+    exposure_time_s: 0.1         # SITE-SPECIFIC: tune with accumulations to stay near 0.25 s/reading
+    accumulations: 1
+    dark_mode: reuse_loaded
+    fit_function: "Pseudo Voigt"
+    fit_peak_count: 1
+    peak_sort_order: x_desc
+    baseline_model: constant
+    sensor: ruby
+    pressure_scale: ruby_shen_2020   # SITE-SPECIFIC: match your lab's adopted ruby scale
+    zero_pressure_peak: 694.3        # SITE-SPECIFIC: R1 line position at zero pressure/current temperature
+    pressure_peak_index: 1
+
+pace5000_api:
+  # Loopback default: this app + apps/PACE5000/app.py --api run on the same
+  # PC as PACE5000 itself. Change if the PACE5000 control app runs elsewhere.
+  base_url: "http://127.0.0.1:8765"
+  api_key: null              # only required if pace5000_api is bound to a non-loopback host
+  timeout_s: 5.0
+  status_poll_interval_s: 0.25
+  default_rate_mpa_per_min: 5.0   # ramp rate used for every PACE5000 setpoint write
+  # true = after confirming Measure, staging a current-pressure-based safe
+  # setpoint, and confirming its readback, automatically switch to Control.
+  # false = perform the same safe staging but wait for an operator to enable
+  # Control externally.
+  ensure_control_mode_enabled: true
+
+hysteresis:
+  reach_margin_gpa: 0.10       # predicted >= target - this  -> treat as reached, go HOLD
+  reapproach_margin_gpa: 0.15  # filtered  <  target - this  -> allowed to resume APPROACH from HOLD
+  overshoot_margin_gpa: 0.05   # max(filtered, latest raw) > target + this -> HOLD
+
+approach:
+  approach_margin_gpa: 0.05          # internal control_target = user_target - this
+  approach_factor: 0.5               # fraction of predicted_error requested per step
+  prediction_horizon_s: 5.0
+  near_target_distance_gpa: 0.2      # inside this distance from target, get more conservative
+  near_target_max_sample_step_gpa: 0.015   # 15 MPa-equivalent sample-pressure step cap near target (10-20 MPa range)
+  near_target_slope_threshold_scale: 0.5   # multiplies the region's settle-slope threshold (stricter) near target
+  near_target_extra_settle_time_s: 5.0     # added to the region's minimum_settle_time_s near target
+  min_membrane_step_mpa: 0.001       # below this, treat as "nothing meaningful to command"
+  membrane_arrival_tolerance_mpa: 0.01     # a step only counts as settled once actual is within this of commanded
+  # Independent observed dP/dt safety cap; units are GPa/min. This remains
+  # SITE-SPECIFIC and should be made more conservative where appropriate.
+  max_compression_rate_gpa_per_min: 0.5
+
+# Gain scheduling, SITE-SPECIFIC: calibrate against your cell/gasket/membrane.
+# Bands must be contiguous and increasing; the last band's max is the
+# effective ceiling for gain lookups (SafetySupervisor.max_sample_pressure_gpa
+# is the real hard limit, independent of this table). Each max_membrane_step
+# must also be reachable (at pace5000_api.default_rate_mpa_per_min) within
+# that band's minimum_settle_time_s — Configuration validates this at load
+# time, since a step that's still ramping when the blackout clock expires
+# can be mistaken for settled.
+gain_regions:
+  - sample_pressure_min_gpa: 0.0
+    sample_pressure_max_gpa: 0.5
+    safe_gain: 0.08                     # GPa (sample) per MPa (membrane), conservative prior
+    max_sample_step_gpa: 0.10
+    max_membrane_step: 0.6              # at 5.0 MPa/min this ramps in 7.2s, within minimum_settle_time_s below
+    minimum_settle_time_s: 8.0
+    settled_slope_threshold_gpa_s: 0.004
+  - sample_pressure_min_gpa: 0.5
+    sample_pressure_max_gpa: 1.0
+    safe_gain: 0.12
+    max_sample_step_gpa: 0.08
+    max_membrane_step: 0.6
+    minimum_settle_time_s: 10.0
+    settled_slope_threshold_gpa_s: 0.003
+  - sample_pressure_min_gpa: 1.0
+    sample_pressure_max_gpa: 1.5
+    safe_gain: 0.18
+    max_sample_step_gpa: 0.06
+    max_membrane_step: 0.4
+    minimum_settle_time_s: 12.0
+    settled_slope_threshold_gpa_s: 0.0025
+  - sample_pressure_min_gpa: 1.5
+    sample_pressure_max_gpa: 2.0
+    safe_gain: 0.28
+    max_sample_step_gpa: 0.04
+    max_membrane_step: 0.25
+    minimum_settle_time_s: 15.0
+    settled_slope_threshold_gpa_s: 0.002
+  - sample_pressure_min_gpa: 2.0
+    sample_pressure_max_gpa: 3.0
+    safe_gain: 0.45
+    max_sample_step_gpa: 0.03
+    max_membrane_step: 0.15
+    minimum_settle_time_s: 20.0
+    settled_slope_threshold_gpa_s: 0.0015
+  - sample_pressure_min_gpa: 3.0
+    sample_pressure_max_gpa: 6.0
+    safe_gain: 0.70
+    max_sample_step_gpa: 0.02
+    max_membrane_step: 0.08
+    minimum_settle_time_s: 25.0
+    settled_slope_threshold_gpa_s: 0.001
+
+gain_estimation:
+  bin_width_gpa: 0.5
+  min_samples_for_estimate: 3
+  safety_factor: 1.0
+  upper_percentile: 90.0
+  neighbor_bins: 1
+
+estimator:
+  outlier_median_window: 7
+  smoothing_window_s: 3.0
+  slope_window_s: 6.0
+  min_points_for_valid: 3
+  max_sample_age_s: 3.0
+  max_jump_gpa: 0.3
+  min_r2: 0.9      # set null to disable the fit-quality gate
+  min_intensity: null
+
+safety:
+  max_sample_pressure_gpa: 5.0    # SITE-SPECIFIC: set to your experiment's planned ceiling
+  max_membrane_pressure_mpa: 6.0  # PACE5000/membrane hardware limit
+  max_membrane_step_mpa_hard: 1.0  # must be >= every gain_regions[].max_membrane_step below
+  max_cumulative_step_mpa: 2.0    # must be > max_membrane_step_mpa_hard, else one max-size command
+                                  # exhausts the whole cumulative_window_s budget (see Configuration
+                                  # validation) and every later command gets command_blocked
+  cumulative_window_s: 60.0
+  max_stale_sample_s: 3.0
+  max_consecutive_invalid: 5
+  max_consecutive_comm_errors: 3
+  sample_jump_hard_gpa: 0.5
+  max_consecutive_jump_flags: 3
+  setpoint_mismatch_tol_mpa: 0.05
+  setpoint_mismatch_grace_s: 0.0   # a commanded/read-back mismatch PAUSEs on the first fresh status
+  max_setpoint_actual_gap_mpa: 1.0 # must be >= max_membrane_step_mpa_hard; larger active gaps PAUSE immediately
+  # Strict requirement is supply > setpoint. Increase this if the PACE5000
+  # needs additional working headroom at your site.
+  minimum_source_pressure_headroom_mpa: 0.0
+  ruby_error_pause_after_s: 3.0
+  membrane_error_pause_after_s: 3.0
+
+logging:
+  directory: "./logs"
+  run_name: null    # null = auto timestamp
+  flush_every_n: 1
+
+control:
+  dry_run: true   # MUST be explicitly set to false (or --live on the CLI) to allow real PACE5000 writes
+  loop_min_interval_s: 0.2
+  default_target_pressure_gpa: null
