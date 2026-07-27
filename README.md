@@ -229,6 +229,11 @@ explicitly, but should only be loosened after reviewing the cell response.
 python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 ```
 
+Or, equivalently, run `./setup.sh` (macOS/Linux) or `setup.bat` (Windows) from
+the repo root — either creates `.venv` and installs the same `[dev]` extras
+(add `--gui` for the GUI extras). After that, every command below is a single
+invocation of something under `.venv/`.
+
 **Simulator** (no hardware, no network — safe to run anytime):
 
 ```bash
@@ -262,6 +267,26 @@ a second showing state, filtered/predicted pressure, slope, membrane
 setpoint/actual, positive supply pressure, the currently-used safe gain, and
 any active safety reasons. A logging failure is shown as `LOGGING-ERROR` but
 does not itself PAUSE pressure control.
+
+### Running the GUI
+
+Needs the `gui` extras installed (`.venv/bin/pip install -e ".[dev,gui]"`, or
+`./setup.sh --gui` / `setup.bat --gui`). Same flags as the CLI above
+(`--config` required; `--sim`, `--seed`, `--target`, `--dry-run`/`--live`),
+via the `pressurekeeper-gui` console script:
+
+```bash
+.venv/bin/pressurekeeper-gui --config config/default.yaml --sim --target 1.0
+```
+
+The window title shows which mode is active (`SIMULATOR` / `DRY-RUN` /
+`LIVE`). A live plot and the Pause/Resume/Abort/Reset controls are always
+visible above two tabs, **Single Target** and **Schedule** (the latter
+disables the former while a multi-target run is in progress). Opening the
+window does not start anything — sensors are first read and the PACE5000 is
+first reconciled only after clicking **Start Control**. Closing the window
+(or Ctrl-C) stops and confirms the PACE5000 output before exiting, the same
+as `quit` in the CLI.
 
 ## Logging
 
