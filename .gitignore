@@ -8,3 +8,14 @@ build/
 dist/
 logs/
 CLAUDE.md
+
+# Any config file the GUI's "Configure Parameters" -> Save & Apply writes
+# (see gui/main_window.py's _prompt_params_save_path -- it refuses to ever
+# overwrite config/default.yaml itself, but the operator picks the filename
+# for everything else) may carry site-specific values and, historically,
+# risked carrying an already-expanded API key. Untrack every config file
+# except the one deliberately tracked default.
+config/*.yaml
+config/*.yml
+config/*.toml
+!config/default.yaml

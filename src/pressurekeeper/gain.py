@@ -32,6 +32,14 @@ class GainEstimator:
         self._cfg = config
         self._bins: dict[int, list[float]] = defaultdict(list)
 
+    def update_config(self, config: GainEstimationConfig) -> None:
+        """Hot-swap the config and discard all recorded gain observations --
+        a changed `bin_width_gpa` would otherwise make existing bin indices
+        meaningless. Only safe to call before any steps have been recorded
+        (see gui/parameters_config_dialog.py: gated to before Start Control).
+        """
+        self.__init__(config)
+
     def _bin_index(self, sample_pressure_gpa: float) -> int:
         return int(sample_pressure_gpa // self._cfg.bin_width_gpa)
 
@@ -49,6 +57,16 @@ class GainEstimator:
         self._bins[self._bin_index(pivot)].append(gain)
 
     def estimate(self, sample_pressure_gpa: float, prior_region: GainRegion) -> GainEstimate:
+        # Floor for the dynamic gas-side rate cap (see GainRegion.rate_limit_gain's
+        # docstring): independent of, and never lower than, whatever safe_gain
+        # this call ends up returning below -- guards the case a configured
+        # prior turns out to be optimistic relative to real hardware, which
+        # the online estimate alone only corrects for once enough observations
+        # accumulate near this band.
+        rate_limit_floor = (
+            prior_region.rate_limit_gain if prior_region.rate_limit_gain is not None else prior_region.safe_gain
+        )
+
         center = self._bin_index(sample_pressure_gpa)
         gathered: list[float] = list(self._bins.get(center, []))
         for radius in range(1, self._cfg.neighbor_bins + 1):
@@ -63,6 +81,7 @@ class GainEstimator:
                 gain_uncertainty=0.0,
                 source="prior",
                 n_samples=len(gathered),
+                rate_limit_gain=max(prior_region.safe_gain, rate_limit_floor),
             )
 
         median_gain = statistics.median(gathered)
@@ -83,4 +102,5 @@ class GainEstimator:
             gain_uncertainty=uncertainty,
             source="observed",
             n_samples=len(gathered),
+            rate_limit_gain=max(safe_gain, rate_limit_floor),
         )

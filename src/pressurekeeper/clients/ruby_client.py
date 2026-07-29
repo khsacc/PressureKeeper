@@ -179,6 +179,23 @@ class RubyPressureClient:
         self._cfg.api_key = api_key
         self._session.headers["X-API-Key"] = api_key
 
+    def update_config(self, config: RubyApiConfig) -> None:
+        """Hot-swap timeout/poll_interval/acquisition settings.
+
+        Only for the GUI's "Configure Parameters" dialog, and only meant to
+        be called before the control loop has started (same reasoning as
+        `update_connection`). Callers must pass a config whose
+        base_url/api_key already match this client's current live values
+        (gui/parameters_config_dialog.py builds its merged config by starting
+        from `controller.config`, which shares this same object graph, so
+        they always do) -- otherwise this would silently revert a prior
+        `update_connection()` call.
+        """
+        self._cfg = config
+        self._session.headers["X-API-Key"] = config.api_key
+        self._body = self._build_body(config)
+        self._timeout_s = self._effective_timeout(config)
+
 
 def _optional_float(value: object) -> float | None:
     if value is None:

@@ -455,3 +455,30 @@ def test_membrane_control_mode_disabled_still_flagged_when_not_intended():
     status = MembraneStatus(t_mono=now, connected=True, pressure_mpa=1.0, target_pressure_mpa=1.0, control_mode=False)
     verdict = safety.evaluate(est, status, now)
     assert any(e.code == "membrane_control_mode_disabled" for e in verdict.events)
+
+
+def test_membrane_control_mode_disabled_suppressed_within_resume_grace():
+    # Real PACE5000 status reads can lag a set_control_mode(True) write by
+    # more than one poll interval -- a still-False readback in the first
+    # tick or two after a resume request must not be mistaken for a genuine
+    # external relinquish (see OneSidedPressureController._reconcile_membrane_drive).
+    safety = SafetySupervisor(_safety_cfg(), start_t=0.0)
+    est_cfg = _estimator_cfg()
+    est, now = fresh_estimator(est_cfg)
+    safety.on_membrane_status(now)
+    status = MembraneStatus(t_mono=now, connected=True, pressure_mpa=1.0, target_pressure_mpa=1.0, control_mode=False)
+    verdict = safety.evaluate(est, status, now, control_mode_resume_grace_until=now + 2.0)
+    assert not any(e.code == "membrane_control_mode_disabled" for e in verdict.events), \
+        "a still-False readback within the resume grace window must not PAUSE"
+
+
+def test_membrane_control_mode_disabled_flagged_after_resume_grace_expires():
+    safety = SafetySupervisor(_safety_cfg(), start_t=0.0)
+    est_cfg = _estimator_cfg()
+    est, now = fresh_estimator(est_cfg)
+    safety.on_membrane_status(now)
+    status = MembraneStatus(t_mono=now, connected=True, pressure_mpa=1.0, target_pressure_mpa=1.0, control_mode=False)
+    verdict = safety.evaluate(est, status, now, control_mode_resume_grace_until=now - 0.001)
+    assert any(e.code == "membrane_control_mode_disabled" for e in verdict.events), \
+        "a still-False readback after the resume grace window expires must still PAUSE " \
+        "(a genuine external relinquish must still be caught)"

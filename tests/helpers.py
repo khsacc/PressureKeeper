@@ -156,8 +156,24 @@ class ScriptedMembrane:
         self.control_mode_commands: list[tuple[float, bool]] = []
         self.operations: list[tuple[str, float, float | bool]] = []
         self.fail_control_mode_writes = 0  # test hook: raise this many times before succeeding
+        # test hook: number of read_status() calls after a set_control_mode()
+        # write before the readback actually reflects it -- models a real
+        # PACE5000 control app answering the write with 200 OK before its own
+        # status endpoint has caught up (see safety.py's
+        # control_mode_resume_grace_until / membrane_control_mode_disabled).
+        self.control_mode_readback_delay_reads = 0
+        self._pending_control_mode: bool | None = None
+        self._pending_control_mode_reads_remaining = 0
 
     def read_status(self) -> MembraneStatus:
+        if self._pending_control_mode is not None:
+            if self._pending_control_mode_reads_remaining > 0:
+                self._pending_control_mode_reads_remaining -= 1
+            else:
+                self.control_mode = self._pending_control_mode
+                if self.control_mode:
+                    self.actual = self.setpoint
+                self._pending_control_mode = None
         now = self._clock.now()
         return MembraneStatus(t_mono=now, connected=True, pressure_mpa=self.actual,
                                target_pressure_mpa=self.setpoint, control_mode=self.control_mode,
@@ -174,9 +190,21 @@ class ScriptedMembrane:
         if self.fail_control_mode_writes > 0:
             self.fail_control_mode_writes -= 1
             raise MembraneCommError("scripted control_mode write failure")
-        self.control_mode = enabled
-        if enabled:
-            self.actual = self.setpoint
+        if self.control_mode_readback_delay_reads > 0 and enabled != self.control_mode:
+            # _reconcile_membrane_drive retries this write every tick until
+            # the readback confirms it -- only the *first* such request
+            # starts the simulated lag countdown; a repeat request for the
+            # same still-pending value must not push the deadline back out
+            # (real hardware doesn't restart its own catch-up just because
+            # it received the same command again).
+            if self._pending_control_mode != enabled:
+                self._pending_control_mode = enabled
+                self._pending_control_mode_reads_remaining = self.control_mode_readback_delay_reads
+        else:
+            self.control_mode = enabled
+            if enabled:
+                self.actual = self.setpoint
+            self._pending_control_mode = None
         self.control_mode_commands.append((self._clock.now(), enabled))
         self.operations.append(("control_mode", self._clock.now(), enabled))
 

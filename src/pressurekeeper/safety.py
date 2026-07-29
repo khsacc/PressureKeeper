@@ -48,10 +48,12 @@ class SafetySupervisor:
         self._last_ruby_ok_t: float | None = None
         self._consecutive_ruby_errors = 0
         self._first_ruby_error_in_streak_t: float | None = None
+        self._last_ruby_error_t: float | None = None
 
         self._last_membrane_ok_t: float | None = None
         self._consecutive_membrane_errors = 0
         self._first_membrane_error_in_streak_t: float | None = None
+        self._last_membrane_error_t: float | None = None
 
         self._consecutive_jump_flags = 0
 
@@ -59,6 +61,16 @@ class SafetySupervisor:
         self._last_command_t: float | None = None
 
         self._recent_steps: deque[tuple[float, float]] = deque()
+
+    def update_config(self, config: SafetyConfig, start_t: float) -> None:
+        """Hot-swap the config, resetting all tracked state (manual
+        pause/abort flags, comm-error streaks, cumulative-step window, etc.)
+        as if freshly constructed. Only safe to call before the control loop
+        has started ticking -- see gui/parameters_config_dialog.py, gated to
+        before Start Control -- since this discards the abort/pause latch
+        along with everything else.
+        """
+        self.__init__(config, start_t)
 
     # ------------------------------------------------------------- event feed
 
@@ -78,6 +90,7 @@ class SafetySupervisor:
         self._consecutive_ruby_errors += 1
         if self._first_ruby_error_in_streak_t is None:
             self._first_ruby_error_in_streak_t = now
+        self._last_ruby_error_t = now
 
     def on_membrane_status(self, now: float) -> None:
         self._last_membrane_ok_t = now
@@ -88,6 +101,7 @@ class SafetySupervisor:
         self._consecutive_membrane_errors += 1
         if self._first_membrane_error_in_streak_t is None:
             self._first_membrane_error_in_streak_t = now
+        self._last_membrane_error_t = now
 
     def on_command_issued(self, membrane_step_mpa: float, new_setpoint_mpa: float, now: float) -> None:
         self._recent_steps.append((now, membrane_step_mpa))
@@ -118,8 +132,10 @@ class SafetySupervisor:
             self._manual_pause_reason = None
         self._consecutive_ruby_errors = 0
         self._first_ruby_error_in_streak_t = None
+        self._last_ruby_error_t = None
         self._consecutive_membrane_errors = 0
         self._first_membrane_error_in_streak_t = None
+        self._last_membrane_error_t = None
         self._consecutive_jump_flags = 0
         # A reset starts a new target reconciliation while remaining in
         # Measure. Do not let the pre-abort target expectation prevent that
@@ -143,6 +159,31 @@ class SafetySupervisor:
     def is_manually_paused(self) -> bool:
         with self._flag_lock:
             return self._manual_pause
+
+    @property
+    def last_command_t(self) -> float | None:
+        """Timestamp of the most recent command accepted via on_command_issued
+        (regular step or staged rearm), or None if none has been issued yet.
+        Only ever written from the polling thread, so unlike the manual
+        pause/abort flags this needs no lock."""
+        return self._last_command_t
+
+    def comm_errors_recent(self, now: float, within_s: float) -> bool:
+        """Whether a ruby or PACE5000 read has failed within the last
+        `within_s` seconds, even if the streak itself has since ended.
+
+        A single failed read (or a streak that just recovered) doesn't by
+        itself reach the consecutive-error or elapsed-time thresholds that
+        raise their own PAUSE event, but a pressure-slope reading computed
+        from a window that straddles a recent gap/discontinuity in the data
+        is not yet a trustworthy basis for a *pure* compression-rate
+        condition (see OneSidedPressureController._try_hold_at_current_pressure).
+        Callers should pass their slope estimator's own smoothing window as
+        `within_s`, since that's the span the slope reading actually draws on."""
+        for last_error_t in (self._last_ruby_error_t, self._last_membrane_error_t):
+            if last_error_t is not None and now - last_error_t < within_s:
+                return True
+        return False
 
     # ------------------------------------------------------------ pre-command
 
@@ -198,6 +239,7 @@ class SafetySupervisor:
         now: float,
         extra_events: list[SafetyEvent] | None = None,
         max_compression_rate_gpa_per_min: float | None = None,
+        control_mode_resume_grace_until: float | None = None,
     ) -> SafetyVerdict:
         events: list[SafetyEvent] = list(extra_events or [])
 
@@ -315,14 +357,29 @@ class SafetySupervisor:
             events.append(SafetyEvent(now, "membrane_disconnected", "pause",
                                        "PACE5000 control app reports the membrane controller is not connected"))
 
-        if membrane_status is not None and membrane_status.control_mode is False and not stop_intended:
+        within_resume_grace = (
+            control_mode_resume_grace_until is not None and now < control_mode_resume_grace_until
+        )
+        if (
+            membrane_status is not None
+            and membrane_status.control_mode is False
+            and not stop_intended
+            and not within_resume_grace
+        ):
             # If remote control is relinquished (e.g. an operator takes the
             # panel to local control) any set_pressure() call we
             # issue is silently ignored by the device, so this must pause
             # just like a lost connection. Suppressed while `stop_intended`
             # is set: that means *we* disabled control mode on purpose (see
             # OneSidedPressureController._stop_membrane), not an external
-            # relinquish.
+            # relinquish. Also suppressed for a short grace window right
+            # after we asked to re-enable Control (control_mode_resume_grace_until,
+            # from OneSidedPressureController._reconcile_membrane_drive): on
+            # real hardware, the PACE5000 control app's write can 200 OK
+            # before its own status endpoint reports control_mode=True, so a
+            # still-False readback in the first tick or two after a resume
+            # request is expected lag, not a real external relinquish -- see
+            # membrane_control_mode_disabled in the README/CLAUDE.md history.
             events.append(SafetyEvent(now, "membrane_control_mode_disabled", "pause",
                                        "PACE5000 is not in remote control mode; commands would be ignored"))
 

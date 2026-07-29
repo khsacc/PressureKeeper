@@ -206,6 +206,25 @@ class Pace5000Client:
         else:
             self._session.headers.pop("X-API-Key", None)
 
+    def update_config(self, config: Pace5000ApiConfig) -> None:
+        """Hot-swap timeout/status_poll_interval/default_rate/
+        ensure_control_mode_enabled settings.
+
+        Only for the GUI's "Configure Parameters" dialog, and only meant to
+        be called before the control loop has started (same reasoning as
+        `update_connection`). Callers must pass a config whose
+        base_url/api_key already match this client's current live values
+        (gui/parameters_config_dialog.py builds its merged config by starting
+        from `controller.config`, which shares this same object graph, so
+        they always do) -- otherwise this would silently revert a prior
+        `update_connection()` call.
+        """
+        self._cfg = config
+        if config.api_key:
+            self._session.headers["X-API-Key"] = config.api_key
+        else:
+            self._session.headers.pop("X-API-Key", None)
+
 
 def _optional_float(value: object) -> float | None:
     if value is None:

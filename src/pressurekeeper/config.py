@@ -7,6 +7,8 @@ logic. See config/default.yaml for a documented example.
 from __future__ import annotations
 
 import math
+import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Literal
@@ -99,6 +101,14 @@ class Pace5000ApiConfig(BaseModel):
     status_poll_interval_s: float = Field(default=0.25, gt=0, allow_inf_nan=False)
     default_rate_mpa_per_min: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     ensure_control_mode_enabled: bool = True
+    # After we write set_control_mode(True), the PACE5000 control app's own
+    # status endpoint can lag behind the write by more than one poll interval
+    # before it reports control_mode=True (observed on real hardware: a
+    # write can 200 OK before the device has actually latched into remote
+    # control). Without this grace window, SafetySupervisor treats that
+    # still-False readback as an external relinquish and PAUSEs, which
+    # re-stops and re-arms every tick -- see membrane_control_mode_disabled.
+    control_mode_resume_grace_s: float = Field(default=2.0, ge=0, allow_inf_nan=False)
 
 
 class HysteresisConfig(BaseModel):
@@ -123,6 +133,15 @@ class ApproachConfig(BaseModel):
     near_target_extra_settle_time_s: float = Field(default=5.0, ge=0, allow_inf_nan=False)
     min_membrane_step_mpa: float = Field(default=0.001, gt=0, allow_inf_nan=False)
     membrane_arrival_tolerance_mpa: float = Field(default=0.01, ge=0, allow_inf_nan=False)
+    # Extra buffer added on top of a step's own physical ramp time (membrane_step
+    # / gas-side slew rate) when computing that step's settle blackout -- see
+    # OneSidedPressureController._update_pending_step. Keeps a slow
+    # membrane_rate_mpa_per_min (e.g. one sized to respect
+    # max_compression_rate_gpa_per_min at high gain) from ever letting settle
+    # detection fire while the membrane is still mid-ramp toward this step's
+    # own target, without requiring a fast fixed rate the way the old
+    # rate-vs-minimum_settle_time_s floor did.
+    ramp_time_margin_s: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     # Operator-facing ceiling on how fast sample pressure is allowed to rise,
     # independent of (and further restricting) gain_regions[].max_sample_step_gpa.
     # None = no additional cap (existing per-region step caps still apply).
@@ -285,51 +304,6 @@ class Configuration(BaseModel):
             )
         return self
 
-    def regions_exceeding_ramp_time_budget(self, rate_mpa_per_min: float) -> list[GainRegion]:
-        """Gain regions whose largest allowed step would take longer to
-        physically ramp at `rate_mpa_per_min` than minimum_settle_time_s
-        waits -- shared between _region_ramp_time_within_settle (checked
-        against the configured default at load time) and
-        OneSidedPressureController.set_membrane_rate_mpa_per_min (checked
-        against an operator-entered value at runtime), since both must
-        preserve the same invariant: see that validator for why.
-        """
-        rate_mpa_per_s = rate_mpa_per_min / 60.0
-        if rate_mpa_per_s <= 0:
-            return []
-        return [
-            r for r in self.gain_regions
-            if (r.max_membrane_step / rate_mpa_per_s) > r.minimum_settle_time_s + 1e-9
-        ]
-
-    @model_validator(mode="after")
-    def _region_ramp_time_within_settle(self) -> "Configuration":
-        # A region's largest allowed step must finish ramping (at the rate we
-        # actually command the PACE5000 with) before minimum_settle_time_s
-        # elapses. Otherwise the blackout clock alone can expire while the
-        # membrane is still physically mid-ramp toward the *previous* step's
-        # target, the slope-threshold check can't tell that apart from a true
-        # settle (the sample hasn't felt the rest of the step yet either), and
-        # the next step's baseline (the commanded setpoint) stacks on top of a
-        # setpoint the membrane hasn't reached yet.
-        rate = self.pace5000_api.default_rate_mpa_per_min
-        offending = self.regions_exceeding_ramp_time_budget(rate)
-        if offending:
-            rate_mpa_per_s = rate / 60.0
-            bad = ", ".join(
-                f"[{r.sample_pressure_min_gpa}-{r.sample_pressure_max_gpa}) GPa: "
-                f"ramp time {r.max_membrane_step / rate_mpa_per_s:.1f}s > "
-                f"minimum_settle_time_s={r.minimum_settle_time_s}"
-                for r in offending
-            )
-            raise ValueError(
-                f"pace5000_api.default_rate_mpa_per_min ({rate}) "
-                f"means the largest step allowed in these regions takes longer to ramp than "
-                f"minimum_settle_time_s waits, so settle detection could fire before the membrane "
-                f"has physically arrived: {bad}"
-            )
-        return self
-
     def region_for(self, sample_pressure_gpa: float) -> GainRegion:
         for region in self.gain_regions:
             if region.contains(sample_pressure_gpa):
@@ -353,9 +327,63 @@ def _read_raw(path: Path) -> dict:
     raise ValueError(f"Unsupported config file extension: {suffix!r} (use .yaml/.yml/.toml)")
 
 
+_ENV_VAR_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _expand_env_vars(value: object) -> object:
+    """Recursively replace any string value that is *entirely* "${NAME}"
+    with os.environ["NAME"], failing fast (rather than silently leaving the
+    literal placeholder in place) if it's unset -- so secrets like
+    ruby_api.api_key / pace5000_api.api_key never need to be committed to a
+    config file (see config/default.yaml's placeholders and CLAUDE.md's
+    "never commit the real key here"). Only a whole-string match expands
+    (not substitution inside a larger string) to keep this unambiguous.
+    """
+    if isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env_vars(v) for v in value]
+    if isinstance(value, str):
+        m = _ENV_VAR_PATTERN.match(value)
+        if m:
+            name = m.group(1)
+            if name not in os.environ:
+                raise ValueError(
+                    f"config value {value!r} references environment variable {name!r}, "
+                    "which is not set"
+                )
+            return os.environ[name]
+    return value
+
+
 def load_config(path: str | Path) -> Configuration:
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"Config file not found: {path}")
-    raw = _read_raw(path)
+    raw = _expand_env_vars(_read_raw(path))
     return Configuration.model_validate(raw)
+
+
+_REDACTED_RUBY_API_KEY_PLACEHOLDER = "${PRESSUREKEEPER_RUBY_API_KEY}"
+_REDACTED_PACE5000_API_KEY_PLACEHOLDER = "${PRESSUREKEEPER_PACE5000_API_KEY}"
+
+
+def redact_api_keys(dumped: dict) -> dict:
+    """Replace already-expanded API-key secrets in a `Configuration.model_dump()`
+    dict with the same "${ENV_VAR}" placeholder convention config/default.yaml's
+    own comments recommend (see `_expand_env_vars` above) -- for anywhere a
+    dumped config is persisted outside the process's own memory (a GUI-saved
+    YAML file, a run's manifest.json), where the literal secret
+    `_expand_env_vars` resolved at load time must never land. The dict this
+    produces still loads cleanly via `load_config()` as long as the named
+    environment variable is set again; it is not meant to be loaded as-is.
+    """
+    dumped = dict(dumped)
+    ruby = dict(dumped["ruby_api"])
+    ruby["api_key"] = _REDACTED_RUBY_API_KEY_PLACEHOLDER
+    dumped["ruby_api"] = ruby
+    pace = dict(dumped["pace5000_api"])
+    if pace.get("api_key"):
+        pace["api_key"] = _REDACTED_PACE5000_API_KEY_PLACEHOLDER
+        dumped["pace5000_api"] = pace
+    return dumped

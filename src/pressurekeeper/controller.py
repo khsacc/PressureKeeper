@@ -79,6 +79,26 @@ class OneSidedPressureController:
         self._next_step_id = 1
         self._settled_since: float | None = None
         self._prior_state_before_pause: ControlState | None = None
+        # Compression-rate-only PAUSE recovery (see _try_hold_at_current_pressure):
+        # once the fresh-actual-pressure hold target below has been written and
+        # confirmed, _rate_pause_holding latches so Control stays armed against
+        # it (countering leaks) instead of re-stopping every tick while the
+        # observed slope remains above the cap. _rate_pause_eligible tracks
+        # whether *every* tick since this PAUSE episode began has been caused
+        # solely by compression_rate_exceeded -- a transient sensor artefact
+        # (e.g. a hard_sample_jump) whose slope-window echo outlives the jump
+        # itself must never retroactively qualify.
+        self._rate_pause_eligible = False
+        self._rate_pause_holding = False
+        self._rate_pause_hold_setpoint: float | None = None
+        self._rate_pause_hold_t_command: float | None = None
+        # Set once per resume episode, the first tick _reconcile_membrane_drive
+        # starts attempting to re-arm Control (stop_intended False but
+        # control_mode not yet confirmed True) -- never renewed on later ticks
+        # of the same episode, so a control_mode that never actually comes
+        # back (a genuine external relinquish) still PAUSEs once this expires.
+        # See safety.py's membrane_control_mode_disabled check.
+        self._control_mode_resume_grace_until: float | None = None
         self._last_command_reason: str | None = None
         self._last_command_decision: dict | None = None
         self._logging_error = initial_logging_error
@@ -122,6 +142,63 @@ class OneSidedPressureController:
 
     # --------------------------------------------------------------- control
 
+    def apply_config_update(self, config: Configuration) -> None:
+        """Hot-swap the entire Configuration this controller, its estimator,
+        gain_estimator, and safety supervisor use -- without reconstructing
+        the ruby/membrane clients, the logger, or restarting the process.
+
+        Only meant to be called from the GUI's "Configure Parameters" dialog
+        (see gui/parameters_config_dialog.py), and only before Start Control:
+        `estimator`/`gain_estimator`/`safety` are reset to their fresh-
+        construction state (see their own `update_config()`), which would
+        corrupt an in-progress run's buffered history, gain observations, and
+        pause/abort latch. Does not touch `self.user_target_gpa` -- an
+        operator-entered target (e.g. via the Single Target tab) must not be
+        silently overwritten by config.control.default_target_pressure_gpa.
+        A lowered `config.safety.max_sample_pressure_gpa` still takes effect
+        immediately even though `user_target_gpa` itself is left alone: every
+        approach/hold/step-sizing decision reads the target through
+        `_effective_target_gpa()`, which clamps to the current ceiling (see
+        its docstring). Callers may still want to warn the operator that
+        `user_target_gpa` exceeds the new ceiling so they know why approach
+        stopped short of the value they originally entered.
+        """
+        with self._lock:
+            self._cfg = config
+            self._estimator.update_config(config.estimator)
+            self._gain_estimator.update_config(config.gain_estimation)
+            self._safety.update_config(config.safety, self._clock.now())
+            # SafetySupervisor.update_config() resets membrane_stop_intended
+            # to its own construction default (False) -- restore the
+            # startup invariant that nothing re-arms Control until a fresh
+            # safe setpoint has been staged and confirmed.
+            self._safety.set_membrane_stop_intended(True)
+        # Reapply the operator-adjustable rate caps against the new config
+        # (new gain_regions in particular) using the existing setters, so
+        # membrane_rate_mpa_per_min's settle-time-vs-ramp-time invariant is
+        # re-validated against the new gain_regions rather than silently
+        # left checked against the old ones.
+        self.set_max_compression_rate(config.approach.max_compression_rate_gpa_per_min)
+        self.set_membrane_rate_mpa_per_min(config.pace5000_api.default_rate_mpa_per_min)
+
+    def _effective_target_gpa(self) -> float:
+        """`user_target_gpa` clamped to the current safety ceiling.
+
+        `set_target()` rejects a target above `safety.max_sample_pressure_gpa`
+        at entry, but the ceiling itself can be lowered afterwards via
+        `apply_config_update()` while an operator target set under the old,
+        higher ceiling is still in effect. Every approach/hold/step-sizing
+        decision must route through this (rather than reading
+        `user_target_gpa` directly) so a lowered ceiling caps forward motion
+        on the very next tick -- not only once the hard
+        `sample_pressure_over_limit` abort in safety.py trips. Unlike a
+        target *reduction* (see `set_target`'s `_target_reduction_hold`),
+        this never latches: raising the ceiling back up immediately raises
+        the effective target again, since nothing here changes when the
+        ceiling changes, only what it's compared against.
+        """
+        return min(self.user_target_gpa, self._cfg.safety.max_sample_pressure_gpa)
+
     def set_target(self, target_gpa: float) -> None:
         if not math.isfinite(target_gpa) or target_gpa < 0:
             raise ValueError(f"target must be a finite, non-negative pressure (got {target_gpa!r})")
@@ -144,6 +221,9 @@ class OneSidedPressureController:
                 self._target_reduction_resume_floor_gpa = old_target if floor is None else max(floor, old_target)
                 self._safety.set_membrane_stop_intended(True)
                 self._abandon_motion(self._clock.now(), "target reduction interrupted the active/staged step")
+                self._rate_pause_eligible = False
+                self._rate_pause_holding = False
+                self._rate_pause_hold_setpoint = None
                 if self.state not in (ControlState.PAUSE, ControlState.ABORT):
                     self._set_state(ControlState.HOLD, self._clock.now(), "target was lowered; holding one-sided actuator")
                 stop_now = True
@@ -192,32 +272,17 @@ class OneSidedPressureController:
         set_pressure() command (i.e. how fast the membrane/gas pressure
         setpoint itself is allowed to ramp). Independent of
         max_compression_rate_gpa_per_min, which caps the resulting sample
-        pressure rise rather than the gas-side ramp.
-
-        A rate slower than config-load time assumed can silently break the
-        settle-detection invariant (see Configuration._region_ramp_time_
-        within_settle): the blackout clock could then expire while the
-        membrane is still physically mid-ramp toward the previous step's
-        target, so this rejects any value that would reopen that gap for
-        the current gain_regions, exactly as the config loader would.
+        pressure rise rather than the gas-side ramp -- satisfying the latter
+        at high gain can require a rate much slower than gain_regions was
+        sized around. A slower rate no longer needs rejecting here: each
+        step's settle blackout now extends to cover that step's own actual
+        ramp time at whatever rate it was commanded with (see
+        _update_pending_step), so settle detection can no longer fire while
+        the membrane is still mid-ramp regardless of how slow this is.
         """
         if not math.isfinite(mpa_per_min) or mpa_per_min <= 0:
             raise ValueError(
                 f"membrane_rate_mpa_per_min must be finite and > 0 (got {mpa_per_min!r})"
-            )
-        offending = self._cfg.regions_exceeding_ramp_time_budget(mpa_per_min)
-        if offending:
-            rate_mpa_per_s = mpa_per_min / 60.0
-            bad = ", ".join(
-                f"[{r.sample_pressure_min_gpa}-{r.sample_pressure_max_gpa}) GPa: "
-                f"ramp time {r.max_membrane_step / rate_mpa_per_s:.1f}s > "
-                f"minimum_settle_time_s={r.minimum_settle_time_s}"
-                for r in offending
-            )
-            raise ValueError(
-                f"membrane_rate_mpa_per_min={mpa_per_min} means the largest step allowed in these "
-                f"regions would take longer to ramp than minimum_settle_time_s waits, so settle "
-                f"detection could fire before the membrane has physically arrived: {bad}"
             )
         with self._lock:
             self._membrane_rate_mpa_per_min = mpa_per_min
@@ -232,6 +297,8 @@ class OneSidedPressureController:
         self._emergency_stop_attempt()
         with self._lock:
             self._abandon_motion(self._clock.now(), reason)
+            self._rate_pause_holding = False
+            self._rate_pause_hold_setpoint = None
 
     def resume(self) -> None:
         self._safety.clear_manual_pause()
@@ -242,6 +309,8 @@ class OneSidedPressureController:
         self._emergency_stop_attempt()
         with self._lock:
             self._abandon_motion(self._clock.now(), reason)
+            self._rate_pause_holding = False
+            self._rate_pause_hold_setpoint = None
 
     def reset(self) -> None:
         """Operator-only recovery from ABORT. Never called automatically.
@@ -254,6 +323,8 @@ class OneSidedPressureController:
             self._safety.set_membrane_stop_intended(True)
             self.state = ControlState.APPROACH
             self._abandon_motion(self._clock.now(), "operator reset")
+            self._rate_pause_holding = False
+            self._rate_pause_hold_setpoint = None
             self._prior_state_before_pause = None
         # Usually ABORT has already done this, but Reset is exposed to an
         # operator and must be safe even if invoked outside ABORT.
@@ -390,6 +461,7 @@ class OneSidedPressureController:
             verdict = self._safety.evaluate(
                 self._estimator, status, now, extra_events,
                 max_compression_rate_gpa_per_min=self._max_compression_rate_gpa_per_min,
+                control_mode_resume_grace_until=self._control_mode_resume_grace_until,
             )
 
             # Safety action before logging: a logging failure (disk full,
@@ -412,20 +484,58 @@ class OneSidedPressureController:
         if verdict.level == "abort":
             self._safety.set_membrane_stop_intended(True)
             self._abandon_motion(now, "safety abort interrupted the active/staged step")
+            self._rate_pause_holding = False
+            self._rate_pause_hold_setpoint = None
             self._set_state(ControlState.ABORT, now, "safety abort")
         elif verdict.level == "pause":
-            if self.state != ControlState.PAUSE:
+            entering_pause = self.state != ControlState.PAUSE
+            if entering_pause:
                 self._prior_state_before_pause = self.state
-            # Every PAUSE is a Measure boundary.  Re-arming an old setpoint,
-            # even after a brief external switch to Measure, is forbidden.
-            self._safety.set_membrane_stop_intended(True)
-            self._abandon_motion(now, "pause interrupted the active/staged step")
+                self._rate_pause_eligible = True
+            # Every PAUSE is a Measure boundary: an old device setpoint is
+            # never re-armed. The one exception is a PAUSE episode caused,
+            # every tick since it began, solely by compression_rate_exceeded:
+            # once _try_hold_at_current_pressure has written and confirmed a
+            # *freshly computed* current-pressure hold target, Control stays
+            # armed against it so the PACE5000 itself counteracts small leaks
+            # for the rest of the episode, instead of repeating a
+            # stop/measure/rebase cycle every tick while the observed slope
+            # stays above the cap. Requiring purity since entry (not just this
+            # tick) matters because a hard_sample_jump's effect on the slope
+            # estimate can outlive the jump event itself: the first tick or
+            # two of such an episode carry both events, but by the time the
+            # jump flag itself stops firing, treating the lingering
+            # compression_rate_exceeded alone as "rate-only" would hold-rebase
+            # against a cause that was never purely a rate issue. A ruby/
+            # PACE5000 comm error within the slope window disqualifies it the
+            # same way, even after the streak itself has ended and even
+            # before it was ever old/long enough to raise its own PAUSE
+            # event: the slope estimate spans slope_window_s, so a gap inside
+            # that window (e.g. right after a ruby outage clears) still
+            # taints the reading it's computed from.
+            rate_only_this_tick = (
+                all(e.code == "compression_rate_exceeded" for e in verdict.events)
+                and not self._safety.comm_errors_recent(now, self._cfg.estimator.slope_window_s)
+            )
+            self._rate_pause_eligible = self._rate_pause_eligible and rate_only_this_tick
+            if self._rate_pause_eligible and self._rate_pause_holding:
+                pass
+            else:
+                if not self._rate_pause_eligible:
+                    self._rate_pause_holding = False
+                    self._rate_pause_hold_setpoint = None
+                self._safety.set_membrane_stop_intended(True)
+                self._abandon_motion(now, "pause interrupted the active/staged step")
+                if self._rate_pause_eligible:
+                    self._try_hold_at_current_pressure(now)
             reason = "; ".join(e.message for e in verdict.events) or "paused"
             self._set_state(ControlState.PAUSE, now, reason)
         else:
             # evaluate() always returns "pause" while manually paused, so
             # reaching this branch already implies the manual pause has
             # been cleared.
+            self._rate_pause_holding = False
+            self._rate_pause_hold_setpoint = None
             if self.state == ControlState.PAUSE:
                 resumed = self._prior_state_before_pause or ControlState.APPROACH
                 self._prior_state_before_pause = None
@@ -442,10 +552,23 @@ class OneSidedPressureController:
 
     def _reconcile_membrane_drive(self, now: float) -> None:
         if self._safety.membrane_stop_intended:
+            self._control_mode_resume_grace_until = None
             if self._membrane_status is None or self._membrane_status.control_mode is not False:
                 self._stop_membrane(now)
         else:
-            if self._membrane_status is None or self._membrane_status.control_mode is not True:
+            control_mode_confirmed_true = (
+                self._membrane_status is not None and self._membrane_status.control_mode is True
+            )
+            if control_mode_confirmed_true:
+                self._control_mode_resume_grace_until = None
+            elif self._control_mode_resume_grace_until is None:
+                # First tick of this resume episode that still needs a
+                # write/wait -- start the grace window now, and never renew
+                # it on later ticks of the same episode (see __init__).
+                self._control_mode_resume_grace_until = (
+                    now + self._cfg.pace5000_api.control_mode_resume_grace_s
+                )
+            if not control_mode_confirmed_true:
                 self._resume_membrane_drive(now)
 
     def _stop_membrane(self, now: float) -> None:
@@ -494,6 +617,127 @@ class OneSidedPressureController:
                                      "re-enabled PACE5000 control mode"))
         return True
 
+    def _try_hold_at_current_pressure(self, now: float) -> None:
+        """Recovery specific to a compression-rate-only PAUSE (see
+        _apply_verdict): once Measure is confirmed, stage the *current,
+        fresh* actual membrane pressure -- no forward step -- as the new
+        setpoint and re-enable Control, so the PACE5000's own regulation
+        counteracts small leaks for the rest of the episode instead of
+        sitting inertly in Measure until the observed slope drops back under
+        the configured cap. Never re-arms the stale pre-pause setpoint: the
+        target used here is always the actual pressure read this tick.
+        """
+        if self._rate_pause_hold_setpoint is not None:
+            self._confirm_rate_pause_hold(now)
+            return
+        if self._membrane_status is None or self._membrane_status.control_mode is not False:
+            return  # awaiting Measure confirmation; retried every tick
+        if not self._membrane_status_fresh_this_tick or self._membrane_status.pressure_mpa is None:
+            return
+        current_actual = self._membrane_status.pressure_mpa
+        filtered = self._estimator.filtered_pressure()
+        slope = self._estimator.pressure_slope()
+        if filtered is None or slope is None:
+            return
+        sizing_pressure = self._conservative_sample_pressure(filtered)
+        # If _advance() would put/keep this at HOLD once the pause clears
+        # anyway (at/above the overshoot margin, or already predicted to
+        # reach the target), its own hysteresis already protects against
+        # small dips -- mirrors the two HOLD checks at the top of _advance().
+        # Skipping the rebase here matters because ordinary measurement
+        # noise can transiently trip compression_rate_exceeded right at
+        # HOLD; without this, every such blip would write a redundant hold
+        # command that plain Measure-and-clear would never have issued.
+        # Uses the same ceiling-clamped target _advance() does (see
+        # _effective_target_gpa) so a lowered safety ceiling isn't re-armed
+        # against here either.
+        target = self._effective_target_gpa()
+        hyst = self._cfg.hysteresis
+        if sizing_pressure > target + hyst.overshoot_margin_gpa:
+            return
+        predicted = max(
+            filtered + max(slope, 0.0) * self._cfg.approach.prediction_horizon_s,
+            sizing_pressure,
+        )
+        if predicted >= target - hyst.reach_margin_gpa:
+            return
+        # Respect the same settle blackout as any other command: issuing this
+        # write before the previous command's minimum_settle_time_s has
+        # elapsed would repeat the exact hazard the blackout exists to
+        # prevent (see the module docstring's tuning note) -- stacking a new
+        # command before the last one's real response is even observable.
+        last_command_t = self._safety.last_command_t
+        if last_command_t is not None:
+            region = self._cfg.region_for(sizing_pressure)
+            if now - last_command_t < region.minimum_settle_time_s:
+                return
+        allowed, reason = self._safety.check_command(
+            0.0, current_actual, now,
+            source_pressure_mpa=self._membrane_status.source_pressure_positive_mpa,
+            allow_while_stopped=True,
+        )
+        if not allowed:
+            self._log_event(SafetyEvent(now, "command_blocked", "warning", reason or "blocked"))
+            return
+        if self._cfg.control.dry_run:
+            self._log_event(SafetyEvent(now, "dry_run_command_suppressed", "info",
+                                         f"would hold membrane setpoint at {current_actual:.4f} MPa "
+                                         "to counteract leaks during a compression-rate pause; "
+                                         "write suppressed by dry_run"))
+            self._rate_pause_holding = True
+            self._safety.set_membrane_stop_intended(False)
+            return
+        try:
+            self._membrane.set_pressure(current_actual, self._membrane_rate_mpa_per_min)
+        except MembraneCommError as e:
+            self._log_event(SafetyEvent(now, "membrane_write_ambiguous", "warning",
+                                         f"hold-at-current-pressure write may or may not have applied: {e}"))
+        self._safety.on_command_issued(0.0, current_actual, now)
+        self._rate_pause_hold_setpoint = current_actual
+        self._rate_pause_hold_t_command = now
+        self._log_event(SafetyEvent(now, "rate_pause_hold_staged", "info",
+                                     f"staged hold setpoint {current_actual:.4f} MPa in Measure "
+                                     "to counteract leaks during compression-rate pause"))
+
+    def _confirm_rate_pause_hold(self, now: float) -> None:
+        """Confirm the hold-at-current-pressure write before re-enabling
+        Control -- mirrors _confirm_staged_rearm's fresh-readback gate."""
+        status = self._membrane_status
+        setpoint = self._rate_pause_hold_setpoint
+        assert setpoint is not None
+        if (
+            not self._membrane_status_fresh_this_tick
+            or status is None
+            or status.t_mono <= self._rate_pause_hold_t_command
+            or status.target_pressure_mpa is None
+            or status.pressure_mpa is None
+        ):
+            return
+
+        tolerance = self._cfg.safety.setpoint_mismatch_tol_mpa
+        if abs(status.target_pressure_mpa - setpoint) > tolerance:
+            # SafetySupervisor emits its own PAUSE event for the same
+            # mismatch. Remain in Measure and do not overwrite evidence with
+            # another write.
+            return
+
+        source = status.source_pressure_positive_mpa
+        required_source = setpoint + self._cfg.safety.minimum_source_pressure_headroom_mpa
+        if source is None or not math.isfinite(source) or source <= required_source:
+            return
+
+        if (
+            not self._cfg.pace5000_api.ensure_control_mode_enabled
+            and status.control_mode is not True
+        ):
+            return  # wait for an operator to arm Control manually
+
+        self._rate_pause_holding = True
+        self._safety.set_membrane_stop_intended(False)
+        self._log_event(SafetyEvent(now, "rate_pause_hold_confirmed", "info",
+                                     f"confirmed hold setpoint {setpoint:.4f} MPa; re-enabling Control "
+                                     "while the compression-rate pause continues"))
+
     def _advance(self, now: float) -> None:
         if not self._estimator.is_valid(now):
             return
@@ -510,26 +754,27 @@ class OneSidedPressureController:
         if self._pending_step is not None and not self._safety.membrane_stop_intended:
             self._update_pending_step(filtered, slope, now)
 
+        target = self._effective_target_gpa()
         hyst = self._cfg.hysteresis
         if self._target_reduction_hold:
             self._safety.set_membrane_stop_intended(True)
             self._abandon_motion(now, "target reduction entered HOLD")
             self._set_state(ControlState.HOLD, now, "target was lowered; one-sided control remains stopped")
             return
-        if sizing_pressure > self.user_target_gpa + hyst.overshoot_margin_gpa:
+        if sizing_pressure > target + hyst.overshoot_margin_gpa:
             self._safety.set_membrane_stop_intended(True)
             self._abandon_motion(now, "sample pressure exceeded target")
             self._set_state(ControlState.HOLD, now, "sample pressure above target + overshoot margin")
             return
 
-        if predicted >= self.user_target_gpa - hyst.reach_margin_gpa:
+        if predicted >= target - hyst.reach_margin_gpa:
             self._safety.set_membrane_stop_intended(True)
             self._abandon_motion(now, "target reach prediction entered HOLD")
             self._set_state(ControlState.HOLD, now, "predicted pressure within reach margin of target")
             return
 
         if self.state == ControlState.HOLD:
-            if filtered < self.user_target_gpa - hyst.reapproach_margin_gpa:
+            if filtered < target - hyst.reapproach_margin_gpa:
                 self._set_state(ControlState.APPROACH, now, "pressure fell below re-approach margin")
             else:
                 return
@@ -555,7 +800,7 @@ class OneSidedPressureController:
                 # the STOP write after this state-machine pass.
                 return
             self._maybe_issue_step(
-                filtered, sizing_pressure, slope, predicted, now,
+                filtered, sizing_pressure, slope, predicted, target, now,
                 stage_for_rearm=True,
             )
             return
@@ -571,7 +816,7 @@ class OneSidedPressureController:
             # against a possibly-still-disabled output.
             return
 
-        self._maybe_issue_step(filtered, sizing_pressure, slope, predicted, now)
+        self._maybe_issue_step(filtered, sizing_pressure, slope, predicted, target, now)
 
     def _update_pending_step(self, filtered: float, slope: float, now: float) -> None:
         step = self._pending_step
@@ -594,7 +839,21 @@ class OneSidedPressureController:
 
         settle_confirmed = self._settled_since is not None and (now - self._settled_since) >= min_settle
         response_start_t = step.t_drive_started or step.t_command
-        blackout_elapsed = (now - response_start_t) >= min_settle
+
+        # A step commanded at a slower membrane_rate_mpa_per_min than
+        # region.minimum_settle_time_s was written for (e.g. a slew
+        # deliberately slowed to respect max_compression_rate_gpa_per_min --
+        # see set_membrane_rate_mpa_per_min) can still be physically mid-ramp
+        # once minimum_settle_time_s alone has elapsed. Extend the blackout
+        # for *this step* to also cover its own actual ramp time, using the
+        # rate that was in effect when it was commanded (step.decision),
+        # not whatever the operator may have changed it to since.
+        commanded_rate = step.decision.get("membrane_rate_mpa_per_min") or self._membrane_rate_mpa_per_min
+        membrane_step_mpa = step.membrane_pressure_after - step.membrane_pressure_before
+        ramp_time_s = 0.0
+        if commanded_rate and commanded_rate > 0 and membrane_step_mpa > 0:
+            ramp_time_s = membrane_step_mpa / (commanded_rate / 60.0) + self._cfg.approach.ramp_time_margin_s
+        blackout_elapsed = (now - response_start_t) >= max(min_settle, ramp_time_s)
 
         # A flat slope only means "settled" if the membrane has actually
         # finished ramping to the commanded setpoint — otherwise it can just
@@ -626,6 +885,7 @@ class OneSidedPressureController:
         sizing_pressure: float,
         slope: float,
         predicted: float,
+        target_gpa: float,
         now: float,
         *,
         stage_for_rearm: bool = False,
@@ -645,13 +905,13 @@ class OneSidedPressureController:
         gain_est = self._gain_estimator.estimate(sizing_pressure, region)
 
         approach = self._cfg.approach
-        control_target = self.user_target_gpa - approach.approach_margin_gpa
+        control_target = target_gpa - approach.approach_margin_gpa
         predicted_error = control_target - predicted
         if predicted_error <= 0:
             return
 
         max_sample_step = region.max_sample_step_gpa
-        if (self.user_target_gpa - predicted) < approach.near_target_distance_gpa:
+        if (target_gpa - predicted) < approach.near_target_distance_gpa:
             max_sample_step = min(max_sample_step, approach.near_target_max_sample_step_gpa)
         # Never let a step's implied sample-pressure rise cross into a
         # higher-gain region than the one `gain_est` was just computed for --
@@ -676,6 +936,23 @@ class OneSidedPressureController:
             return
 
         membrane_step = max(0.0, min(requested_sample_step / safe_gain, region.max_membrane_step))
+
+        # Tighten (never loosen) the gas-side slew for *this* command so the
+        # resulting sample-pressure rate can't exceed max_compression_rate_
+        # gpa_per_min even at this region's (possibly much higher, near the
+        # top of the plant's nonlinear gain) gain -- sizing the step itself
+        # for the compression cap (max_sample_step above) only bounds the
+        # *average* rate over minimum_settle_time_s, not the real,
+        # front-loaded response actually observed against hardware. The
+        # extended settle blackout above already tolerates a slower rate.
+        # Uses gain_est.rate_limit_gain, not safe_gain: see
+        # GainRegion.rate_limit_gain's docstring -- a step-sizing prior that
+        # turns out to be optimistic relative to real hardware must not also
+        # under-restrict the one independent, physically-grounded rate cap.
+        effective_rate_mpa_per_min = self._membrane_rate_mpa_per_min
+        if self._max_compression_rate_gpa_per_min is not None:
+            rate_cap_mpa_per_min = self._max_compression_rate_gpa_per_min / gain_est.rate_limit_gain
+            effective_rate_mpa_per_min = min(effective_rate_mpa_per_min, rate_cap_mpa_per_min)
 
         current_setpoint = (
             self._membrane_status.pressure_mpa
@@ -725,9 +1002,10 @@ class OneSidedPressureController:
             "estimated_gain": gain_est.estimated_gain,
             "gain_uncertainty": gain_est.gain_uncertainty,
             "safe_gain": safe_gain,
+            "rate_limit_gain": gain_est.rate_limit_gain,
             "requested_sample_step_gpa": requested_sample_step,
             "membrane_step_mpa": membrane_step,
-            "membrane_rate_mpa_per_min": self._membrane_rate_mpa_per_min,
+            "membrane_rate_mpa_per_min": effective_rate_mpa_per_min,
             "region_min_gpa": region.sample_pressure_min_gpa,
             "region_max_gpa": region.sample_pressure_max_gpa,
             "source_pressure_positive_mpa": source_pressure,
@@ -765,7 +1043,7 @@ class OneSidedPressureController:
         )
 
         try:
-            self._membrane.set_pressure(new_setpoint, self._membrane_rate_mpa_per_min)
+            self._membrane.set_pressure(new_setpoint, effective_rate_mpa_per_min)
         except MembraneCommError as e:
             # The write may have applied on the device even though we never
             # got the HTTP response back. Commit the same bookkeeping a
@@ -976,7 +1254,7 @@ class OneSidedPressureController:
             t_mono=now,
             state=self.state,
             user_target_gpa=self.user_target_gpa,
-            control_target_gpa=self.user_target_gpa - self._cfg.approach.approach_margin_gpa,
+            control_target_gpa=self._effective_target_gpa() - self._cfg.approach.approach_margin_gpa,
             raw_pressure_gpa=last_sample.pressure_gpa if last_sample else None,
             filtered_pressure_gpa=filtered,
             pressure_slope_gpa_s=self._estimator.pressure_slope(),

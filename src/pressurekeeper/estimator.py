@@ -40,6 +40,18 @@ class PressureEstimator:
         self._last_jump_flagged: bool = False
         self._last_sample: RubyPressureSample | None = None
 
+    def update_config(self, config: EstimatorConfig) -> None:
+        """Hot-swap the estimator's config, discarding all buffered history.
+
+        `_raw_window`/`_median_history` are `deque`s with `maxlen` fixed at
+        construction, so a changed `outlier_median_window` can't just be
+        assigned onto `self._cfg` -- re-running `__init__` is the only way to
+        resize them. Only safe to call before any samples have been fed in
+        (see gui/parameters_config_dialog.py: gated to before Start Control),
+        since it forgets everything filtered/smoothed so far.
+        """
+        self.__init__(config)
+
     # ------------------------------------------------------------------ update
 
     def update(self, sample: RubyPressureSample) -> None:

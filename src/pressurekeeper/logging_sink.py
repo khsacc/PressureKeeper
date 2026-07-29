@@ -8,6 +8,13 @@ Four files per run, all timestamp-keyed so they can be joined in analysis:
                      observed gain) — the online sensitivity data set
   * events.csv    — safety events and state transitions
 
+Plus manifest.json, a small run-level record (git SHA, mode, whether Control
+was ever started, and how the run ended) -- unlike the four CSVs above, this
+is written even when a run never produces a single tick (e.g. the operator
+opened the GUI and closed it without pressing Start, or the very first
+step() call raised before anything else could log), so a completely empty
+CSV set is no longer a total dead end when reviewing a run after the fact.
+
 CSV was chosen over SQLite to keep the dependency footprint at zero; any
 other sink (e.g. SQLite) can be swapped in by implementing the same method
 surface, since callers only depend on this class's public API.
@@ -15,6 +22,9 @@ surface, since callers only depend on this class's public API.
 from __future__ import annotations
 
 import csv
+import json
+import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -23,6 +33,18 @@ from typing import TextIO
 
 from .config import LoggingConfig
 from .models import ControllerSnapshot, SafetyEvent, StateTransition, StepRecord
+
+
+def _git_sha() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def _echo_to_terminal(tag: str, code: str, message: str) -> None:
@@ -52,7 +74,7 @@ _COMMAND_FIELDS = [
     "membrane_pressure_before", "membrane_pressure_after", "membrane_step_mpa", "membrane_rate_mpa_per_min",
     "sample_pressure_before", "filtered_pressure_gpa", "sizing_pressure_gpa", "pressure_slope_gpa_s",
     "predicted_pressure_gpa", "control_target_gpa", "predicted_error_gpa",
-    "gain_source", "estimated_gain", "gain_uncertainty", "safe_gain",
+    "gain_source", "estimated_gain", "gain_uncertainty", "safe_gain", "rate_limit_gain",
     "requested_sample_step_gpa", "region_min_gpa", "region_max_gpa",
     "source_pressure_positive_mpa", "staged_in_measure",
 ]
@@ -68,13 +90,26 @@ _EVENT_FIELDS = ["t_mono", "t_wall", "kind", "code", "severity", "message", "fro
 
 
 class DataLogger:
-    def __init__(self, config: LoggingConfig) -> None:
+    def __init__(self, config: LoggingConfig, *, mode: str | None = None) -> None:
         run_name = config.run_name or datetime.now().strftime("run_%Y%m%dT%H%M%S_%f")
         self.directory = Path(config.directory) / run_name
         # Logs are part of the safety/audit trail.  Reusing a run name used to
         # truncate all four CSV files silently; fail before opening anything
         # instead of destroying an earlier run.
         self.directory.mkdir(parents=True, exist_ok=False)
+
+        self._manifest: dict[str, object] = {
+            "run_name": run_name,
+            "pid": os.getpid(),
+            "git_sha": _git_sha(),
+            "mode": mode,
+            "started_at_wall": time.time(),
+            "started_control": False,
+            "ended_at_wall": None,
+            "end_reason": None,
+            "crash_traceback": None,
+        }
+        self._write_manifest()
 
         opened: list[TextIO] = []
         try:
@@ -103,6 +138,34 @@ class DataLogger:
 
     def _open(self, name: str, _fields: list[str]) -> TextIO:
         return (self.directory / name).open("w", newline="", encoding="utf-8")
+
+    def _write_manifest(self) -> None:
+        # Write-then-rename so a reader never sees a half-written file, and a
+        # crash mid-write can't corrupt the previous, still-valid manifest.
+        tmp = self.directory / "manifest.json.tmp"
+        tmp.write_text(json.dumps(self._manifest, indent=2), encoding="utf-8")
+        tmp.replace(self.directory / "manifest.json")
+
+    def mark_control_started(self) -> None:
+        """Call once Control is actually started (CLI: as soon as the polling
+        thread starts; GUI: on the operator's "Start Control" click) -- this
+        is what lets a later read of the manifest tell "opened but never
+        started" apart from every other outcome."""
+        self._manifest["started_control"] = True
+        self._write_manifest()
+
+    def mark_end(self, reason: str, *, crash_traceback: str | None = None) -> None:
+        """Record why the run ended. Safe to call more than once (e.g. a
+        crash handler calling this before the normal close() path also
+        runs); the first call wins so a crash reason is never silently
+        overwritten by close()'s own default."""
+        if self._manifest["end_reason"] is not None:
+            return
+        self._manifest["end_reason"] = reason
+        self._manifest["ended_at_wall"] = time.time()
+        if crash_traceback is not None:
+            self._manifest["crash_traceback"] = crash_traceback
+        self._write_manifest()
 
     def log_tick(self, snap: ControllerSnapshot) -> None:
         self._tick_w.writerow({
@@ -150,6 +213,7 @@ class DataLogger:
             "estimated_gain": d.get("estimated_gain"),
             "gain_uncertainty": d.get("gain_uncertainty"),
             "safe_gain": d.get("safe_gain"),
+            "rate_limit_gain": d.get("rate_limit_gain"),
             "requested_sample_step_gpa": d.get("requested_sample_step_gpa"),
             "region_min_gpa": d.get("region_min_gpa"),
             "region_max_gpa": d.get("region_max_gpa"),
@@ -201,6 +265,13 @@ class DataLogger:
                 f.flush()
 
     def close(self) -> None:
+        # A caller that never had a specific reason to report (the ordinary
+        # process-exit path) still leaves a meaningful record: distinguishing
+        # a run that reached Control from one that was opened and closed
+        # without ever starting is exactly what turns an all-empty CSV set
+        # from a dead end into "this one was never started."
+        if self._manifest["end_reason"] is None:
+            self.mark_end("completed" if self._manifest["started_control"] else "not_started")
         for f in (self._tick_f, self._command_f, self._step_f, self._event_f):
             f.flush()
             f.close()

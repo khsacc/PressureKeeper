@@ -31,6 +31,78 @@ def test_default_yaml_loads_cleanly():
     assert config.ruby_api.acquisition.axis_mode is None
     assert config.approach.max_compression_rate_gpa_per_min == 0.5
     assert config.safety.setpoint_mismatch_grace_s == 0.0
+    # Never a real secret committed to git (see CLAUDE.md); --sim needs no
+    # config at all, so this is a harmless literal placeholder rather than
+    # a "${...}" that load_config() would insist on resolving.
+    assert config.ruby_api.api_key == "REPLACE_ME_SITE_SPECIFIC_RUBY_API_KEY"
+    assert config.pace5000_api.api_key is None
+
+
+def test_env_var_placeholder_is_expanded(tmp_path, monkeypatch):
+    from tests.helpers import make_config
+    base = make_config(tmp_path)
+    raw = base.model_dump()
+    raw["ruby_api"]["api_key"] = "${TEST_PK_RUBY_KEY}"
+    monkeypatch.setenv("TEST_PK_RUBY_KEY", "secret-value-from-env")
+    config = type(base).model_validate(_expand_env_vars_for_test(raw))
+    assert config.ruby_api.api_key == "secret-value-from-env"
+
+
+def test_env_var_placeholder_raises_clearly_when_unset(tmp_path, monkeypatch):
+    from tests.helpers import make_config
+    base = make_config(tmp_path)
+    raw = base.model_dump()
+    raw["ruby_api"]["api_key"] = "${TEST_PK_UNSET_VAR}"
+    monkeypatch.delenv("TEST_PK_UNSET_VAR", raising=False)
+    with pytest.raises(ValueError, match="TEST_PK_UNSET_VAR"):
+        _expand_env_vars_for_test(raw)
+
+
+def test_partial_env_var_syntax_within_a_larger_string_is_left_alone(tmp_path):
+    from tests.helpers import make_config
+    base = make_config(tmp_path)
+    raw = base.model_dump()
+    raw["ruby_api"]["api_key"] = "prefix-${NOT_A_WHOLE_MATCH}-suffix"
+    expanded = _expand_env_vars_for_test(raw)
+    assert expanded["ruby_api"]["api_key"] == "prefix-${NOT_A_WHOLE_MATCH}-suffix"
+
+
+def _expand_env_vars_for_test(raw: dict) -> dict:
+    from pressurekeeper.config import _expand_env_vars
+    return _expand_env_vars(raw)
+
+
+def test_redact_api_keys_replaces_expanded_secrets_with_env_var_placeholders(tmp_path):
+    from pressurekeeper.config import redact_api_keys
+    from tests.helpers import make_config
+
+    config = make_config(tmp_path)
+    dumped = config.model_dump()
+    assert dumped["ruby_api"]["api_key"] == "test-key"  # sanity: the literal secret is really there
+
+    redacted = redact_api_keys(dumped)
+    assert redacted["ruby_api"]["api_key"] == "${PRESSUREKEEPER_RUBY_API_KEY}"
+    assert "test-key" not in str(redacted), "no literal secret may survive redaction"
+    # Unmodified elsewhere, and the original dict passed in must not be mutated.
+    assert redacted["safety"]["max_sample_pressure_gpa"] == dumped["safety"]["max_sample_pressure_gpa"]
+    assert dumped["ruby_api"]["api_key"] == "test-key"
+
+
+def test_redact_api_keys_leaves_a_null_pace5000_key_alone():
+    from pressurekeeper.config import redact_api_keys
+
+    dumped = {"ruby_api": {"api_key": "secret"}, "pace5000_api": {"api_key": None}}
+    redacted = redact_api_keys(dumped)
+    assert redacted["pace5000_api"]["api_key"] is None
+    assert redacted["ruby_api"]["api_key"] == "${PRESSUREKEEPER_RUBY_API_KEY}"
+
+
+def test_redact_api_keys_replaces_a_set_pace5000_key():
+    from pressurekeeper.config import redact_api_keys
+
+    dumped = {"ruby_api": {"api_key": "secret"}, "pace5000_api": {"api_key": "pace-secret"}}
+    redacted = redact_api_keys(dumped)
+    assert redacted["pace5000_api"]["api_key"] == "${PRESSUREKEEPER_PACE5000_API_KEY}"
 
 
 def test_axis_mode_requires_explicit_configuration_id():

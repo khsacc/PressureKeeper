@@ -3,9 +3,10 @@ from pressurekeeper.gain import GainEstimator
 from pressurekeeper.models import GainRegion, StepRecord
 
 
-def make_region(safe_gain=0.2):
+def make_region(safe_gain=0.2, rate_limit_gain=None):
     return GainRegion(0.0, 5.0, safe_gain=safe_gain, max_sample_step_gpa=0.1,
-                       max_membrane_step=1.0, minimum_settle_time_s=1.0, settled_slope_threshold_gpa_s=0.01)
+                       max_membrane_step=1.0, minimum_settle_time_s=1.0, settled_slope_threshold_gpa_s=0.01,
+                       rate_limit_gain=rate_limit_gain)
 
 
 def settled_step(step_id, before_mpa, after_mpa, before_gpa, after_gpa):
@@ -91,3 +92,46 @@ def test_observed_estimate_floored_at_prior_when_neighbor_bins_pull_in_lower_gai
     assert result.n_samples == 3
     assert result.estimated_gain < region.safe_gain, "the raw observed signal really is lower than prior"
     assert result.safe_gain >= region.safe_gain, "but the safety floor must hold"
+
+
+def test_rate_limit_gain_defaults_to_safe_gain_when_unset():
+    est = GainEstimator(GainEstimationConfig(bin_width_gpa=0.5, min_samples_for_estimate=3,
+                                              safety_factor=1.0, upper_percentile=90.0, neighbor_bins=1))
+    region = make_region(safe_gain=0.28, rate_limit_gain=None)
+    result = est.estimate(1.7, region)
+    assert result.source == "prior"
+    assert result.rate_limit_gain == result.safe_gain == 0.28
+
+
+def test_rate_limit_gain_floors_the_prior_estimate_even_though_safe_gain_alone_would_be_lower():
+    # Regression: a region's safe_gain prior can itself be optimistic
+    # relative to real hardware (see config/default.yaml's gain_regions
+    # note) -- rate_limit_gain must still floor the dynamic-rate-cap gain
+    # even before any online observations exist to correct safe_gain itself.
+    est = GainEstimator(GainEstimationConfig(bin_width_gpa=0.5, min_samples_for_estimate=3,
+                                              safety_factor=1.0, upper_percentile=90.0, neighbor_bins=1))
+    region = make_region(safe_gain=0.28, rate_limit_gain=0.75)
+    result = est.estimate(1.7, region)
+    assert result.source == "prior"
+    assert result.safe_gain == 0.28, "step sizing still uses the plain (unfloored) prior"
+    assert result.rate_limit_gain == 0.75, "the dynamic rate cap must use the separate, more conservative floor"
+
+
+def test_rate_limit_gain_never_falls_below_the_online_safe_gain_estimate():
+    # Even with a low configured rate_limit_gain, once real observations push
+    # the online safe_gain estimate above it, the rate cap must track that
+    # higher, more-informed value rather than staying pinned to the stale
+    # configured floor.
+    est = GainEstimator(GainEstimationConfig(bin_width_gpa=1.0, min_samples_for_estimate=3,
+                                              safety_factor=1.0, upper_percentile=90.0, neighbor_bins=0))
+    region = make_region(safe_gain=0.10, rate_limit_gain=0.15)
+    for i, gain in enumerate([0.28, 0.30, 0.32]):
+        step = settled_step(i, 1.0, 2.0, 0.5, 0.5 + gain)
+        est.record_step(step)
+
+    result = est.estimate(0.5, region)
+    assert result.source == "observed"
+    assert result.safe_gain > 0.15
+    assert result.rate_limit_gain >= result.safe_gain
+    assert result.rate_limit_gain == result.safe_gain, \
+        "the online estimate already exceeds the configured floor, so it alone should govern"

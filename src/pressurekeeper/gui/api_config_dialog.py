@@ -2,13 +2,19 @@
 key for the two HTTP APIs (FluoraPressee ruby API, PACE5000 API) from the
 GUI instead of hand-editing the config file.
 
-Edits only the current process's live client objects (via
-`RubyPressureClient.update_connection()` / `Pace5000Client.update_connection()`)
--- it never writes back to the on-disk config file, so config/default.yaml's
-SITE-SPECIFIC comments and values are untouched. MainWindow only offers this
-dialog before "Start Control" has been pressed (see main_window.py) --
-swapping endpoints mid-control would point the safety-checked loop at a
-different physical device without warning.
+This module only collects and validates form input (host/port/key for both
+APIs, exposed as `ruby_url`/`ruby_api_key`/`pace_url`/`pace_api_key` once
+accepted) -- it never mutates the live client objects or writes back to the
+on-disk config file, so config/default.yaml's SITE-SPECIFIC comments and
+values are untouched. All the policy lives in main_window.py's
+`_on_configure_api()`: applying `RubyPressureClient.update_connection()` /
+`Pace5000Client.update_connection()`, and -- for the PACE5000 endpoint
+specifically -- re-acquiring the single-instance lock against the new
+endpoint before switching (see instance_lock.py) so a changed connection is
+still guarded against a second process. MainWindow only offers this dialog
+before "Start Control" has been pressed -- swapping endpoints mid-control
+would point the safety-checked loop at a different physical device without
+warning.
 """
 from __future__ import annotations
 
@@ -104,10 +110,9 @@ class ApiConfigDialog(QDialog):
             QMessageBox.warning(self, "Configure API", "Ruby API key must not be empty.")
             return
 
-        ruby_url = _join_host_port(self._ruby_client.base_url, self.ruby_group.host(), self.ruby_group.port())
-        pace_url = _join_host_port(self._pace_client.base_url, self.pace_group.host(), self.pace_group.port())
-
-        self._ruby_client.update_connection(base_url=ruby_url, api_key=self.ruby_group.api_key())
-        self._pace_client.update_connection(base_url=pace_url, api_key=self.pace_group.api_key() or None)
+        self.ruby_url = _join_host_port(self._ruby_client.base_url, self.ruby_group.host(), self.ruby_group.port())
+        self.ruby_api_key = self.ruby_group.api_key()
+        self.pace_url = _join_host_port(self._pace_client.base_url, self.pace_group.host(), self.pace_group.port())
+        self.pace_api_key = self.pace_group.api_key() or None
 
         self.accept()

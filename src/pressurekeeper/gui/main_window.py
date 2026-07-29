@@ -11,7 +11,13 @@ sensors or writes to the membrane merely because the window opened.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
+import yaml
+from pydantic import ValidationError
 from PyQt6.QtWidgets import (
+    QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -25,13 +31,33 @@ from PyQt6.QtWidgets import (
 
 from ..app import AppContext
 from ..clients import Pace5000Client, RubyPressureClient
+from ..config import Configuration, redact_api_keys
+from ..instance_lock import InstanceAlreadyRunning, SingleInstanceLock, lock_path_for
 from ..models import ControllerSnapshot
 from .api_config_dialog import ApiConfigDialog
 from .live_plot import LivePlotWidget
 from .membrane_rate_panel import MembraneRatePanel
+from .parameters_config_dialog import ParametersConfigDialog
 from .tab_schedule import ScheduleTab
 from .tab_single_target import SingleTargetTab
 from .worker import ControllerWorker
+
+
+def _deep_update(base: dict, overlay: dict) -> dict:
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _format_validation_error(e: ValidationError) -> str:
+    lines = []
+    for err in e.errors():
+        loc = ".".join(str(p) for p in err["loc"])
+        lines.append(f"{loc}: {err['msg']}")
+    return "\n".join(lines)
 
 
 def _fmt(x: float | None, spec: str = "{:.4f}") -> str:
@@ -54,11 +80,19 @@ def _format_status(snap: ControllerSnapshot) -> str:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, ctx: AppContext, poll_interval_s: float, parent=None) -> None:
+    def __init__(self, ctx: AppContext, config: Configuration, config_path: Path, poll_interval_s: float, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("PressureKeeper")
         self._ctx = ctx
         self._controller = ctx.controller
+        # The Configuration currently in effect for this session -- starts as
+        # whatever was loaded from --config, and is replaced wholesale by
+        # _on_save_apply_parameters() every time "Save & Apply" succeeds, so
+        # reopening Configure Parameters always prefills from the latest
+        # applied state rather than the original file.
+        self._current_config = config
+        self._config_path = config_path
+        self._last_params_save_path: Path | None = None
 
         self.configure_api_action = self.menuBar().addAction("Configure API")
         self.configure_api_action.triggered.connect(self._on_configure_api)
@@ -67,6 +101,9 @@ class MainWindow(QMainWindow):
             # host/port/key to configure.
             self.configure_api_action.setEnabled(False)
             self.configure_api_action.setToolTip("Not available in simulator mode")
+
+        self.configure_parameters_action = self.menuBar().addAction("Configure Parameters")
+        self.configure_parameters_action.triggered.connect(self._on_configure_parameters)
 
         self.live_plot = LivePlotWidget()
         self.tab1 = SingleTargetTab(self._controller)
@@ -132,7 +169,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.resize(1800, 800)
 
-        self.worker = ControllerWorker(self._controller, poll_interval_s)
+        self.worker = ControllerWorker(self._controller, poll_interval_s, logger=self._ctx.logger)
         self.worker.snapshot_ready.connect(self._on_snapshot)
         self.worker.crashed.connect(self._on_worker_crashed)
         # Not started here — see _on_start_clicked.
@@ -145,12 +182,142 @@ class MainWindow(QMainWindow):
         # Repointing a client at a different device mid-control would do so
         # without the safety supervisor ever having characterized it.
         self.configure_api_action.setEnabled(False)
+        # Same reasoning: apply_config_update() resets buffered
+        # history/observations/latched flags, which would corrupt an
+        # in-progress run.
+        self.configure_parameters_action.setEnabled(False)
         self.status_label.setText("control loop starting...")
+        if self._ctx.logger is not None:
+            self._ctx.logger.mark_control_started()
         self.worker.start()
 
     def _on_configure_api(self) -> None:
         dialog = ApiConfigDialog(self._ctx.ruby, self._ctx.membrane, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._ctx.ruby.update_connection(base_url=dialog.ruby_url, api_key=dialog.ruby_api_key)
+        self._apply_pace_endpoint_change(dialog.pace_url, dialog.pace_api_key)
+
+    def _apply_pace_endpoint_change(self, base_url: str, api_key: str | None) -> None:
+        """Repoint `self._ctx.membrane` at `base_url`, re-acquiring the
+        single-instance lock (see instance_lock.py) against the new endpoint
+        first and releasing the old one only after that succeeds.
+
+        Without this, changing the PACE5000 endpoint left the lock keyed to
+        the *old* endpoint forever: no lock was ever held against the new
+        one (a second process could start against it undetected), and the
+        stale lock on the old endpoint was never released either.
+        """
+        old_lock = self._ctx.instance_lock
+        new_lock_path = lock_path_for(base_url)
+        if old_lock is None or new_lock_path == old_lock.path:
+            self._ctx.membrane.update_connection(base_url=base_url, api_key=api_key)
+            return
+
+        new_lock = SingleInstanceLock(new_lock_path)
+        try:
+            new_lock.acquire()
+        except InstanceAlreadyRunning as e:
+            QMessageBox.critical(
+                self, "Configure API",
+                f"Could not switch to the new PACE5000 endpoint: {e}\n\nKeeping the previous connection.",
+            )
+            return
+        self._ctx.membrane.update_connection(base_url=base_url, api_key=api_key)
+        old_lock.release()
+        self._ctx.instance_lock = new_lock
+
+    def _on_configure_parameters(self) -> None:
+        dialog = ParametersConfigDialog(self._current_config, parent=self)
+        dialog.save_apply_btn.clicked.connect(lambda: self._on_save_apply_parameters(dialog))
         dialog.exec()
+
+    def _on_save_apply_parameters(self, dialog: ParametersConfigDialog) -> None:
+        try:
+            overlay = dialog.collect_overlay()
+        except ValueError as e:
+            QMessageBox.warning(self, "Configure Parameters", str(e))
+            return
+
+        merged = _deep_update(self._current_config.model_dump(), overlay)
+        try:
+            new_config = Configuration.model_validate(merged)
+        except ValidationError as e:
+            QMessageBox.critical(
+                self, "Configure Parameters",
+                "These values are inconsistent (same checks as loading a config file "
+                f"at startup) and were not saved or applied:\n\n{_format_validation_error(e)}",
+            )
+            return
+
+        # dry_run itself is not editable from this dialog (see
+        # _LoggingControlTab's docstring) -- new_config.control.dry_run is
+        # therefore always identical to self._current_config.control.dry_run,
+        # so there is nothing to confirm here.
+        is_real_devices = isinstance(self._ctx.ruby, RubyPressureClient) and isinstance(self._ctx.membrane, Pace5000Client)
+
+        chosen_path = self._prompt_params_save_path()
+        if chosen_path is None:
+            return  # operator cancelled -- save & apply is all-or-nothing
+
+        try:
+            with chosen_path.open("w", encoding="utf-8") as f:
+                # Never persist an already-expanded API key to disk:
+                # ParametersConfigDialog deliberately excludes ruby_api/
+                # pace5000_api's base_url/api_key (see its docstring), but
+                # model_dump() still carries whatever secret config.py's
+                # _expand_env_vars() resolved at load time. chosen_path is
+                # not guaranteed gitignored (see .gitignore's config/*.yaml
+                # exception for default.yaml only), so writing that literal
+                # value here would risk committing a real credential.
+                yaml.safe_dump(redact_api_keys(new_config.model_dump()), f, sort_keys=False)
+        except OSError as e:
+            QMessageBox.critical(self, "Configure Parameters", f"Could not write {chosen_path}: {e}")
+            return
+        self._last_params_save_path = chosen_path
+
+        self._controller.apply_config_update(new_config)
+        if is_real_devices:
+            self._ctx.ruby.update_config(new_config.ruby_api)
+            self._ctx.membrane.update_config(new_config.pace5000_api)
+        self._current_config = new_config
+
+        message = (
+            f"Saved to {chosen_path} (API keys redacted to environment-variable placeholders "
+            "in the saved file; the real key(s) remain in effect for this session) and applied "
+            "to this session."
+        )
+        if self._controller.user_target_gpa > new_config.safety.max_sample_pressure_gpa:
+            message += (
+                f"\n\nCurrent target {self._controller.user_target_gpa:.3f} GPa now exceeds the new "
+                f"safety ceiling {new_config.safety.max_sample_pressure_gpa:.3f} GPa -- approach is "
+                "automatically capped at the new ceiling; set a new target explicitly if you want to "
+                "record what you actually intend to reach."
+            )
+        QMessageBox.information(self, "Configure Parameters", message)
+
+    def _prompt_params_save_path(self) -> Path | None:
+        """Repeats the save-file picker until the operator either chooses a
+        path other than the one loaded at startup (config/default.yaml is
+        git-tracked and shared across deployments -- it must not be silently
+        overwritten from the GUI) or cancels."""
+        default_path = self._last_params_save_path or (self._config_path.parent / "local.yaml")
+        while True:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self, "Save parameters as", str(default_path), "YAML files (*.yaml *.yml)",
+            )
+            if not chosen:
+                return None
+            chosen_path = Path(chosen)
+            if chosen_path.resolve() == self._config_path.resolve():
+                QMessageBox.warning(
+                    self, "Configure Parameters",
+                    f"{self._config_path} is the config this session was launched with and must not "
+                    "be overwritten from the GUI -- choose a different filename.",
+                )
+                default_path = self._config_path.parent / "local.yaml"
+                continue
+            return chosen_path
 
     def _on_schedule_running_changed(self, running: bool) -> None:
         self.tabs.setTabEnabled(0, not running)

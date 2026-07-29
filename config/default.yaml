@@ -12,8 +12,17 @@
 ruby_api:
   # SITE-SPECIFIC: hostname/IP of the PC running FluoraPressee.
   base_url: "http://133.11.18.145:8765"
-  # SITE-SPECIFIC: from FluoraPressee's fluora_pressee_api_key.json.
-  api_key: "bplEolmbhPQkQrODVtrOFIbQjA72ZEtg"
+  # SITE-SPECIFIC, and never a literal secret in this tracked file (see
+  # CLAUDE.md: "never commit the real key here"). Copy the real value from
+  # FluoraPressee's own fluora_pressee_api_key.json here on whichever
+  # machine actually runs PressureKeeper -- either directly, or, to avoid
+  # writing it into a file at all, set the environment variable
+  # PRESSUREKEEPER_RUBY_API_KEY and use "${PRESSUREKEEPER_RUBY_API_KEY}"
+  # here instead (resolved at load_config() time, see config.py's
+  # _expand_env_vars; raises clearly if referenced but unset). Left as a
+  # harmless placeholder -- not "${...}" -- so --sim keeps needing no config
+  # at all, since the simulator never constructs a real ruby API client.
+  api_key: "REPLACE_ME_SITE_SPECIFIC_RUBY_API_KEY"
   timeout_s: 5.0
   poll_interval_s: 0.5 # 4 Hz ceiling; do not set below 0.2 s
   acquisition:
@@ -36,15 +45,27 @@ pace5000_api:
   # Loopback default: this app + apps/PACE5000/app.py --api run on the same
   # PC as PACE5000 itself. Change if the PACE5000 control app runs elsewhere.
   base_url: "http://127.0.0.1:8765"
-  api_key: 8UzPKoc3wqCSE5Y1iNfNCaUWjfcoPacH              # only required if pace5000_api is bound to a non-loopback host
+  # Only required if pace5000_api is bound to a non-loopback host -- null
+  # here (the loopback default) means no X-API-Key header is sent. If your
+  # deployment binds this to a non-loopback host, set it the same
+  # environment-variable way as ruby_api.api_key above, e.g.:
+  #   api_key: "${PRESSUREKEEPER_PACE5000_API_KEY}"
+  api_key: null
   timeout_s: 5.0
   status_poll_interval_s: 0.25
-  default_rate_mpa_per_min: 5.0   # ramp rate used for every PACE5000 setpoint write
+  default_rate_mpa_per_min: 5.0   # ramp rate used for every PACE5000 setpoint write, unless a command's
+                                   # own compression-rate-derived slew (see approach.max_compression_rate_gpa_per_min) is slower
   # true = after confirming Measure, staging a current-pressure-based safe
   # setpoint, and confirming its readback, automatically switch to Control.
   # false = perform the same safe staging but wait for an operator to enable
   # Control externally.
   ensure_control_mode_enabled: true
+  # Grace window after we ask to re-enable Control before a still-False
+  # control_mode readback is treated as a real external relinquish and
+  # PAUSEs. On real hardware the PACE5000 control app's write can 200 OK
+  # before its own status endpoint catches up; without this, every resume
+  # flaps STOP/re-arm every tick. See safety.py's membrane_control_mode_disabled.
+  control_mode_resume_grace_s: 2.0
 
 hysteresis:
   reach_margin_gpa: 0.10       # predicted >= target - this  -> treat as reached, go HOLD
@@ -63,20 +84,46 @@ approach:
   membrane_arrival_tolerance_mpa: 0.01     # a step only counts as settled once actual is within this of commanded
   # Independent observed dP/dt safety cap; units are GPa/min. This remains
   # SITE-SPECIFIC and should be made more conservative where appropriate.
+  # Also directly caps each command's gas-side slew rate to
+  # this / safe_gain (see OneSidedPressureController._maybe_issue_step),
+  # since sizing the step alone only bounds the *average* rate.
   max_compression_rate_gpa_per_min: 0.5
+  # Extra buffer added on top of a step's own physical ramp time (membrane
+  # step / whatever rate it was actually commanded at, which can be well
+  # below default_rate_mpa_per_min once max_compression_rate_gpa_per_min
+  # above tightens it) when extending that step's settle blackout. See
+  # OneSidedPressureController._update_pending_step.
+  ramp_time_margin_s: 1.0
 
 # Gain scheduling, SITE-SPECIFIC: calibrate against your cell/gasket/membrane.
 # Bands must be contiguous and increasing; the last band's max is the
 # effective ceiling for gain lookups (SafetySupervisor.max_sample_pressure_gpa
-# is the real hard limit, independent of this table). Each max_membrane_step
-# must also be reachable (at pace5000_api.default_rate_mpa_per_min) within
-# that band's minimum_settle_time_s — Configuration validates this at load
-# time, since a step that's still ramping when the blackout clock expires
-# can be mistaken for settled.
+# is the real hard limit, independent of this table). A step's settle
+# blackout auto-extends to cover its own actual physical ramp time at
+# whatever rate it was commanded with (see approach.ramp_time_margin_s
+# above), so max_membrane_step no longer needs to be reachable within
+# minimum_settle_time_s at any particular fixed rate.
+#
+# rate_limit_gain, SITE-SPECIFIC, currently unset in every band below
+# (falls back to that band's own safe_gain -- i.e. no behaviour change from
+# before this field existed): a separate, independently conservative gain
+# used only to bound the dynamic gas-side slew rate
+# (approach.max_compression_rate_gpa_per_min / gain), kept apart from
+# safe_gain (which sizes the step itself) so a safe_gain prior that turns out
+# to be optimistic relative to real hardware can't also under-restrict the
+# rate cap -- see GainRegion.rate_limit_gain's docstring in models.py.
+# NEEDS CALIBRATION BEFORE LIVE USE: an actual real-hardware run
+# (logs/run_20260727T204500_946421/steps.csv) recorded observed_gain up to
+# ~0.59 in the 1.5-2.0 GPa band against a configured safe_gain of just 0.28
+# there -- more than 2x. Review observed_gain across steps.csv from your own
+# real (non-simulator) runs for every band below and set rate_limit_gain to
+# at least the worst-case value you find, with margin; do not leave this
+# unset for a LIVE run.
 gain_regions:
   - sample_pressure_min_gpa: 0.0
     sample_pressure_max_gpa: 0.5
     safe_gain: 0.08                     # GPa (sample) per MPa (membrane), conservative prior
+    rate_limit_gain: null               # SITE-SPECIFIC, unset -- see the gain_regions note above
     max_sample_step_gpa: 0.10
     max_membrane_step: 0.6              # at 5.0 MPa/min this ramps in 7.2s, within minimum_settle_time_s below
     minimum_settle_time_s: 8.0
@@ -84,6 +131,7 @@ gain_regions:
   - sample_pressure_min_gpa: 0.5
     sample_pressure_max_gpa: 1.0
     safe_gain: 0.12
+    rate_limit_gain: null               # SITE-SPECIFIC, unset -- see the gain_regions note above
     max_sample_step_gpa: 0.08
     max_membrane_step: 0.6
     minimum_settle_time_s: 10.0
@@ -91,6 +139,7 @@ gain_regions:
   - sample_pressure_min_gpa: 1.0
     sample_pressure_max_gpa: 1.5
     safe_gain: 0.18
+    rate_limit_gain: null               # SITE-SPECIFIC, unset -- see the gain_regions note above
     max_sample_step_gpa: 0.06
     max_membrane_step: 0.4
     minimum_settle_time_s: 12.0
@@ -98,6 +147,7 @@ gain_regions:
   - sample_pressure_min_gpa: 1.5
     sample_pressure_max_gpa: 2.0
     safe_gain: 0.28
+    rate_limit_gain: null               # SITE-SPECIFIC, unset -- real logs show observed_gain up to ~0.59 here (see above)
     max_sample_step_gpa: 0.04
     max_membrane_step: 0.25
     minimum_settle_time_s: 15.0
@@ -105,6 +155,7 @@ gain_regions:
   - sample_pressure_min_gpa: 2.0
     sample_pressure_max_gpa: 3.0
     safe_gain: 0.45
+    rate_limit_gain: null               # SITE-SPECIFIC, unset -- see the gain_regions note above
     max_sample_step_gpa: 0.03
     max_membrane_step: 0.15
     minimum_settle_time_s: 20.0
@@ -112,6 +163,7 @@ gain_regions:
   - sample_pressure_min_gpa: 3.0
     sample_pressure_max_gpa: 6.0
     safe_gain: 0.70
+    rate_limit_gain: null               # SITE-SPECIFIC, unset -- see the gain_regions note above
     max_sample_step_gpa: 0.02
     max_membrane_step: 0.08
     minimum_settle_time_s: 25.0

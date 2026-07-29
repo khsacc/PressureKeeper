@@ -67,8 +67,24 @@ class GainRegion:
 
     `safe_gain` is the conservative prior (GPa of sample pressure per MPa of
     membrane pressure) used until enough online observations accumulate near
-    this band. All numeric values are device-specific and must come from
-    configuration, never be hardcoded.
+    this band, and sizes each command's *step* (see
+    OneSidedPressureController._maybe_issue_step: membrane_step =
+    requested_sample_step / safe_gain). All numeric values are device-specific
+    and must come from configuration, never be hardcoded.
+
+    `rate_limit_gain` is a separate, independently conservative gain used only
+    to bound the *dynamic gas-side slew rate*
+    (approach.max_compression_rate_gpa_per_min / gain -- see the same method)
+    when a `safe_gain` prior turns out to be optimistic relative to real
+    hardware. GainEstimator.estimate() already grows its returned safe_gain
+    above the prior once enough online observations accumulate near this
+    band, so this only matters most for the first commands issued into a
+    freshly-visited band, before the online estimate has anything to work
+    with -- exactly when a bad prior is most dangerous. None (the default)
+    falls back to `safe_gain` itself, i.e. no additional margin: set this
+    explicitly, from real hardware step logs, wherever the prior is not
+    trusted to be an upper bound (see config/default.yaml's SITE-SPECIFIC
+    gain schedule notes).
     """
 
     sample_pressure_min_gpa: float
@@ -78,6 +94,7 @@ class GainRegion:
     max_membrane_step: float
     minimum_settle_time_s: float
     settled_slope_threshold_gpa_s: float
+    rate_limit_gain: float | None = None
 
     def __post_init__(self) -> None:
         values = (self.sample_pressure_min_gpa, self.sample_pressure_max_gpa, self.safe_gain,
@@ -96,6 +113,17 @@ class GainRegion:
             # silently returning every tick -- a non-positive prior here
             # freezes control in this band with no error ever logged.
             raise ValueError(f"GainRegion.safe_gain must be > 0 (got {self.safe_gain})")
+        if self.rate_limit_gain is not None:
+            if not math.isfinite(self.rate_limit_gain):
+                raise ValueError(f"GainRegion.rate_limit_gain must be finite (got {self.rate_limit_gain})")
+            if self.rate_limit_gain < self.safe_gain:
+                # A rate-limit gain below the step-sizing prior would make the
+                # dynamic slew cap *less* conservative than plain step sizing
+                # -- exactly backwards from why this field exists.
+                raise ValueError(
+                    f"GainRegion.rate_limit_gain ({self.rate_limit_gain}) must be >= safe_gain "
+                    f"({self.safe_gain})"
+                )
         if self.max_sample_step_gpa <= 0:
             raise ValueError(f"GainRegion.max_sample_step_gpa must be > 0 (got {self.max_sample_step_gpa})")
         if self.max_membrane_step <= 0:
@@ -167,6 +195,7 @@ class GainEstimate:
     gain_uncertainty: float
     source: Literal["prior", "observed"]
     n_samples: int
+    rate_limit_gain: float
 
 
 @dataclass(frozen=True)

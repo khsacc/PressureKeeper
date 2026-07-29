@@ -9,10 +9,13 @@ import select
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from .app import build_app
 from .config import load_config
+from .instance_lock import InstanceAlreadyRunning
+from .logging_sink import DataLogger
 from .models import ControllerSnapshot
 from .sim import DACPhysicsConfig
 
@@ -52,11 +55,13 @@ def _format_snapshot(snap: ControllerSnapshot) -> str:
 
 
 class _ControllerRunner(threading.Thread):
-    def __init__(self, controller, poll_interval_s: float, stop_event: threading.Event) -> None:
+    def __init__(self, controller, poll_interval_s: float, stop_event: threading.Event,
+                 logger: DataLogger | None = None) -> None:
         super().__init__(daemon=True)
         self._controller = controller
         self._poll_interval_s = poll_interval_s
         self._stop_event = stop_event
+        self._logger = logger
         self._lock = threading.Lock()
         self.latest_snapshot: ControllerSnapshot | None = None
         self.last_error: BaseException | None = None
@@ -74,6 +79,12 @@ class _ControllerRunner(threading.Thread):
             except Exception as e:  # fail safe: latch abort, log, stop the loop
                 self.last_error = e
                 self.crashed = True
+                # Written before the abort/stop retry below: that retry does
+                # its own device I/O and can itself raise, and the crash
+                # reason must survive even if the process is killed before
+                # reaching main()'s normal ctx.close() path.
+                if self._logger is not None:
+                    self._safe_mark_crashed()
                 try:
                     self._controller.abort(f"controller loop crashed: {e!r}")
                     snap = self._controller.step()
@@ -90,6 +101,13 @@ class _ControllerRunner(threading.Thread):
             remaining = self._poll_interval_s - elapsed
             if remaining > 0:
                 self._stop_event.wait(remaining)
+
+    def _safe_mark_crashed(self) -> None:
+        # A logging failure here must never mask the crash itself.
+        try:
+            self._logger.mark_end("crashed", crash_traceback=traceback.format_exc())
+        except Exception:
+            pass
 
 
 def _handle_command(line: str, controller, runner: "_ControllerRunner", stop_event: threading.Event) -> None:
@@ -169,7 +187,11 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(args.config)
     sim_physics = DACPhysicsConfig(seed=args.seed) if args.sim else None
-    ctx = build_app(config, use_simulator=args.sim, dry_run=args.dry_run, sim_physics=sim_physics)
+    try:
+        ctx = build_app(config, use_simulator=args.sim, dry_run=args.dry_run, sim_physics=sim_physics)
+    except InstanceAlreadyRunning as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        return 1
 
     if args.target is not None:
         ctx.controller.set_target(args.target)
@@ -191,8 +213,15 @@ def main(argv: list[str] | None = None) -> int:
     # cadence.
     loop_interval_s = max(config.ruby_api.poll_interval_s, config.control.loop_min_interval_s)
     stop_event = threading.Event()
-    runner = _ControllerRunner(ctx.controller, loop_interval_s, stop_event)
+    runner = _ControllerRunner(ctx.controller, loop_interval_s, stop_event, logger=ctx.logger)
     runner.start()
+    # The CLI has no separate "Start Control" step -- the loop above is the
+    # whole point of running this command, so it's the CLI's equivalent of
+    # the GUI's Start Control click (see gui/main_window.py's
+    # _on_start_clicked). This is what lets a later manifest.json read tell
+    # "the loop actually ran" apart from a crash before the first tick.
+    if ctx.logger is not None:
+        ctx.logger.mark_control_started()
 
     try:
         _interactive_loop(ctx.controller, runner, stop_event)

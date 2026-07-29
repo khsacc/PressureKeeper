@@ -156,6 +156,25 @@ re-arm the old target; it executes the guarded Measure → safe target →
 readback → Control sequence above. `reset` likewise remains in Measure until
 that sequence has completed.
 
+**One exception: a `PAUSE` episode caused, every tick since it began, solely
+by the compression-rate cap** (`compression_rate_exceeded`) does not sit
+inertly in Measure for its whole duration. Once Measure is confirmed,
+`_try_hold_at_current_pressure` stages the *fresh actual* membrane pressure
+(no forward step, unlike the guarded sequence's "+ one safe step") as the new
+setpoint and re-enables Control, so the PACE5000's own regulation counters
+small leaks while the observed slope is still above the cap, instead of
+leaving the sample to drift unchecked for however long the slope takes to
+decay. This can retreat the setpoint below the just-interrupted in-flight
+target — safe (never below actual pressure) but a deliberate, bounded
+exception to "setpoint never decreases," justified because the one-sided
+design's premise against reversing course is about the predictor's model
+being direction-asymmetric, not a hard safety wall. It is intentionally
+narrow: any other event on top (a `hard_sample_jump`, a comm-error streak
+within the slope window, a manual pause, ...) disqualifies the whole episode,
+and it never fires close enough to target that `HOLD`'s own hysteresis would
+have handled it anyway. It only ever writes once per episode — Control, once
+re-armed against a fixed setpoint, keeps holding it without further writes.
+
 Lowering a target while a step is in flight immediately enters `HOLD` and
 STOPs the output. Because normal control is one-sided and STOP does not lower
 the old device setpoint, the controller will not re-arm that old setpoint for
