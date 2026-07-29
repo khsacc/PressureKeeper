@@ -18,6 +18,12 @@ CSV set is no longer a total dead end when reviewing a run after the fact.
 CSV was chosen over SQLite to keep the dependency footprint at zero; any
 other sink (e.g. SQLite) can be swapped in by implementing the same method
 surface, since callers only depend on this class's public API.
+
+close() also makes a best-effort attempt to write summary_plots.png (see
+report_plots.py) from the just-closed ticks.csv -- unlike the files above,
+this is a convenience artifact, not part of the audit trail, so a failure
+there (e.g. matplotlib not installed) is swallowed and never affects
+end_reason or any other manifest field.
 """
 from __future__ import annotations
 
@@ -275,6 +281,20 @@ class DataLogger:
         for f in (self._tick_f, self._command_f, self._step_f, self._event_f):
             f.flush()
             f.close()
+        self._write_summary_plot()
+
+    def _write_summary_plot(self) -> None:
+        # Best-effort, and deliberately after the CSVs/manifest above are
+        # already flushed and closed: the audit trail this class exists for
+        # (see module docstring) must never depend on this succeeding.
+        # matplotlib is an optional dependency (pyproject.toml's `plotting`
+        # extra) not required to run this class at all, hence the lazy
+        # import here rather than at module load.
+        try:
+            from .report_plots import write_summary_plots
+            write_summary_plots(self.directory)
+        except Exception as e:
+            _echo_to_terminal("WARN", "plot_export_failed", f"{type(e).__name__}: {e}")
 
     def __enter__(self) -> "DataLogger":
         return self
