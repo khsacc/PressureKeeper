@@ -178,6 +178,14 @@ class GainEstimationConfig(BaseModel):
     local_gain_safety_factor: float = Field(default=1.25, ge=1.0, allow_inf_nan=False)
     local_uncertainty_safety_factor: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     local_curvature_safety_factor: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    # A real-hardware run (logs/run_20260729T164838_686358) showed the
+    # curvature/trend term dominated by measurement noise between two
+    # closely-spaced observations (e.g. 0.0068 GPa apart) rather than genuine
+    # gain curvature, producing a "slope" over 9 GPa/MPa per GPa and pushing
+    # safe_gain to ~4x the largest gain ever actually observed in that run.
+    # Below this minimum pressure span across the local window's candidates,
+    # the trend is treated as unknown (0.0) rather than trusted.
+    local_trend_min_span_gpa: float = Field(default=0.05, ge=0, allow_inf_nan=False)
     response_detection_sigma: float = Field(default=3.0, gt=0, allow_inf_nan=False)
     response_detection_floor_gpa: float = Field(default=0.002, gt=0, allow_inf_nan=False)
     initial_probe_step_mpa: float = Field(default=0.02, gt=0, allow_inf_nan=False)
@@ -195,6 +203,20 @@ class GainEstimationConfig(BaseModel):
     adaptive_no_response_wait_s: float = Field(
         default=30.0, gt=0, allow_inf_nan=False
     )
+    # SITE-SPECIFIC relaxation of the two probe controls above while the
+    # membrane/gas pressure itself is still below a level where a sample-
+    # pressure response is physically implausible (e.g. below the cell's
+    # engagement threshold). Gated on actual membrane pressure, not sample
+    # pressure or distance-to-target -- this is about the known-flat
+    # low-gas-pressure regime specifically. None (default) disables this
+    # entirely; probe sizing/wait then always use
+    # adaptive_probe_max_expected_gain / adaptive_no_response_wait_s as
+    # before, at every pressure.
+    low_pressure_probe_membrane_ceiling_mpa: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+    low_pressure_probe_max_step_mpa: float = Field(default=0.05, gt=0, allow_inf_nan=False)
+    low_pressure_probe_no_response_wait_s: float = Field(default=15.0, gt=0, allow_inf_nan=False)
     max_step_growth_factor: float = Field(default=1.5, ge=1.0, allow_inf_nan=False)
     rate_exceeded_step_backoff_factor: float = Field(default=0.5, gt=0, le=1.0)
     probe_rate_mpa_per_min: float = Field(default=0.5, gt=0, allow_inf_nan=False)
@@ -318,6 +340,14 @@ class Configuration(BaseModel):
             raise ValueError(
                 "gain_estimation.adaptive_max_membrane_step_mpa must be <= "
                 "safety.max_membrane_step_mpa_hard"
+            )
+        if (
+            gain.low_pressure_probe_membrane_ceiling_mpa is not None
+            and gain.low_pressure_probe_max_step_mpa > gain.adaptive_max_membrane_step_mpa
+        ):
+            raise ValueError(
+                "gain_estimation.low_pressure_probe_max_step_mpa must be <= "
+                "adaptive_max_membrane_step_mpa"
             )
         return self
 

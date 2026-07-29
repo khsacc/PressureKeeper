@@ -89,7 +89,8 @@ _COMMAND_FIELDS = [
     "sample_pressure_before", "filtered_pressure_gpa", "sizing_pressure_gpa", "pressure_slope_gpa_s",
     "predicted_pressure_gpa", "control_target_gpa", "predicted_error_gpa",
     "gain_source", "estimated_gain", "gain_uncertainty", "safe_gain", "rate_limit_gain",
-    "local_gain_trend_per_gpa", "step_sizing_mode", "adaptive_probe",
+    "local_gain_trend_per_gpa", "local_observation_span_gpa", "gain_n_samples",
+    "step_sizing_mode", "adaptive_probe",
     "adaptive_probe_max_expected_gain", "probe_target_cap_mpa",
     "rate_gain_source", "interrupted_rate_observation_count", "learned_rate_floor",
     "requested_sample_step_gpa", "region_min_gpa", "region_max_gpa",
@@ -263,6 +264,8 @@ class DataLogger:
             "safe_gain": d.get("safe_gain"),
             "rate_limit_gain": d.get("rate_limit_gain"),
             "local_gain_trend_per_gpa": d.get("local_gain_trend_per_gpa"),
+            "local_observation_span_gpa": d.get("local_observation_span_gpa"),
+            "gain_n_samples": d.get("gain_n_samples"),
             "step_sizing_mode": d.get("step_sizing_mode"),
             "adaptive_probe": d.get("adaptive_probe"),
             "adaptive_probe_max_expected_gain": d.get(

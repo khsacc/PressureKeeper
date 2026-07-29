@@ -268,6 +268,60 @@ def test_adaptive_local_adds_positive_curvature_allowance():
     assert forward.safe_gain > no_forward.safe_gain
 
 
+def test_adaptive_local_trend_ignores_noise_from_closely_spaced_samples():
+    # Regression for logs/run_20260729T164838_686358: two observations only
+    # 0.005 GPa apart with a large gain jump between them is measurement
+    # noise, not a real per-GPa curvature signal, and must not be read as one
+    # -- on real hardware this pattern inflated safe_gain to ~4x the largest
+    # gain ever actually observed in that run, collapsing the commanded
+    # membrane step for the rest of the approach.
+    cfg = GainEstimationConfig(
+        step_sizing_mode="adaptive_local",
+        local_pressure_window_gpa=1.0,
+        local_gain_safety_factor=1.0,
+        local_uncertainty_safety_factor=1.0,
+        local_curvature_safety_factor=1.0,
+        local_trend_min_span_gpa=0.05,
+    )
+    est = GainEstimator(cfg)
+    region = make_region()
+    first = settled_step(1, 1.0, 2.0, 0.950, 1.050)   # midpoint 1.000, gain 0.10
+    first.response_detected = True
+    second = settled_step(2, 1.0, 2.0, 0.855, 1.155)  # midpoint 1.005, gain 0.30
+    second.response_detected = True
+    est.record_step(first)
+    est.record_step(second)
+
+    result = est.estimate(1.005, region, forward_sample_step_gpa=0.03)
+    assert result.local_observation_span_gpa < cfg.local_trend_min_span_gpa
+    assert result.local_gain_trend_per_gpa == 0.0
+    # Without the span gate this would be ~0.30 + 40 * 0.03 = 1.5.
+    assert abs(result.safe_gain - 0.30) < 1e-9
+
+
+def test_adaptive_local_trend_fires_once_span_is_wide_enough():
+    cfg = GainEstimationConfig(
+        step_sizing_mode="adaptive_local",
+        local_pressure_window_gpa=1.0,
+        local_gain_safety_factor=1.0,
+        local_uncertainty_safety_factor=1.0,
+        local_curvature_safety_factor=1.0,
+        local_trend_min_span_gpa=0.05,
+    )
+    est = GainEstimator(cfg)
+    region = make_region()
+    first = settled_step(1, 1.0, 2.0, 0.10, 0.20)   # midpoint 0.15, gain 0.10
+    first.response_detected = True
+    second = settled_step(2, 1.0, 2.0, 0.30, 0.50)  # midpoint 0.40, gain 0.20
+    second.response_detected = True
+    est.record_step(first)
+    est.record_step(second)
+
+    result = est.estimate(0.40, region, forward_sample_step_gpa=0.03)
+    assert result.local_observation_span_gpa >= cfg.local_trend_min_span_gpa
+    assert result.local_gain_trend_per_gpa > 0.0
+
+
 def test_step_observed_gain_prefers_actual_gas_delta_and_censors_no_response():
     step = settled_step(1, 1.0, 2.0, 0.1, 0.3)
     step.membrane_actual_before = 1.0

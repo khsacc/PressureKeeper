@@ -261,6 +261,7 @@ class GainEstimate:
     interrupted_rate_observation_count: int = 0
     learned_rate_floor: float = 0.0
     local_gain_trend_per_gpa: float = 0.0
+    local_observation_span_gpa: float = 0.0
 
 
 @dataclass(frozen=True)

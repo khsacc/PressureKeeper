@@ -68,7 +68,7 @@ pace5000_api:
   control_mode_resume_grace_s: 2.0
 
 hysteresis:
-  reach_margin_gpa: 0.10       # predicted >= target - this  -> treat as reached, go HOLD
+  reach_margin_gpa: 0.03       # predicted >= target - this  -> treat as reached, go HOLD
   reapproach_margin_gpa: 0.15  # filtered  <  target - this  -> allowed to resume APPROACH from HOLD
   overshoot_margin_gpa: 0.05   # max(filtered, latest raw) > target + this -> HOLD
 
@@ -76,7 +76,7 @@ approach:
   approach_margin_gpa: 0.05          # internal control_target = user_target - this
   approach_factor: 0.5               # fraction of predicted_error requested per step
   prediction_horizon_s: 5.0
-  near_target_distance_gpa: 0.2      # inside this distance from target, get more conservative
+  near_target_distance_gpa: 0.08     # inside this distance from target, get more conservative
   near_target_max_sample_step_gpa: 0.015   # 15 MPa-equivalent sample-pressure step cap near target (10-20 MPa range)
   near_target_slope_threshold_scale: 0.5   # multiplies the region's settle-slope threshold (stricter) near target
   near_target_extra_settle_time_s: 5.0     # added to the region's minimum_settle_time_s near target
@@ -185,9 +185,25 @@ gain_estimation:
   neighbor_bins: 1
   local_pressure_window_gpa: 0.25
   local_max_observations: 5
-  local_gain_safety_factor: 1.25
+  # Lowered from 1.25 per operator feedback after real-hardware testing --
+  # the commanded step is size = requested_sample_step / (local gain estimate
+  # * this factor), so this margin directly trades approach speed against
+  # headroom above the observed local gain. The independent hard safety
+  # limits (compression-rate cap, sample_jump_hard_gpa, overshoot margin,
+  # setpoint-mismatch check) are unaffected by this value and still bound
+  # the worst case if a step turns out larger than the plant's real gain
+  # justified.
+  local_gain_safety_factor: 1.15
   local_uncertainty_safety_factor: 1.0
   local_curvature_safety_factor: 1.0
+  # Minimum pressure spread the local window's observations must cover before
+  # the curvature/trend term is trusted at all. A real-hardware run
+  # (logs/run_20260729T164838_686358) showed two settled steps only 0.0068
+  # GPa apart -- ordinary observed_gain noise between them produced an
+  # apparent trend over 9 GPa/MPa per GPa, which then dominated safe_gain and
+  # collapsed the commanded membrane step for the rest of that run (predicted
+  # never got within 0.1 GPa of target). Below this span, trend is 0.0.
+  local_trend_min_span_gpa: 0.05
   response_detection_sigma: 3.0
   response_detection_floor_gpa: 0.002
   initial_probe_step_mpa: 0.02
@@ -196,10 +212,34 @@ gain_estimation:
   # SITE-SPECIFIC high-side physical envelope. Every unknown-gain probe is
   # additionally capped by requested_sample_step / this value, so a restart
   # near target cannot issue the full probe ladder step.
-  adaptive_probe_max_expected_gain: 5.0
+  adaptive_probe_max_expected_gain: 1.0
   # Additional post-ramp observation before "no response" may grow the probe.
   adaptive_no_response_wait_s: 30.0
-  max_step_growth_factor: 1.5
+  # Below this actual membrane/gas pressure, a sample-pressure response is
+  # physically implausible for this cell (operator experience: response
+  # essentially never starts below ~0.5 MPa gas pressure) -- so while an
+  # unknown-gain probe's baseline membrane pressure is below this ceiling,
+  # allow up to low_pressure_probe_max_step_mpa per probe step and shorten
+  # the no-response wait to low_pressure_probe_no_response_wait_s, both
+  # overriding the more paranoid adaptive_probe_max_expected_gain /
+  # adaptive_no_response_wait_s above (which still apply at every other
+  # pressure, including any unknown-gain probe above this ceiling -- e.g.
+  # after a restart/interruption near a higher target). null disables this
+  # relaxation entirely.
+  low_pressure_probe_membrane_ceiling_mpa: 0.5
+  low_pressure_probe_max_step_mpa: 0.05
+  low_pressure_probe_no_response_wait_s: 15.0
+  # Real-hardware run logs/run_20260729T181029_911437 showed a single large
+  # (real, stick-slip-like) observed_gain reading pin safe_gain high for
+  # several steps; once fresh, lower-gain data finally aged it back out
+  # in one jump, the commanded step still took ~5 more cycles to recover
+  # because it could only grow this much per step from the previous
+  # (artificially tiny) command. Raised from 1.5 so recovery from any
+  # transient shrink is faster -- this only paces how fast the step size
+  # may grow, not its absolute ceiling (adaptive_max_membrane_step_mpa) or
+  # any of the independent hard safety limits (compression-rate cap,
+  # sample_jump_hard_gpa, overshoot margin), which still apply unchanged.
+  max_step_growth_factor: 2.0
   rate_exceeded_step_backoff_factor: 0.5
   probe_rate_mpa_per_min: 0.5
   adaptive_max_sample_step_gpa: 0.03

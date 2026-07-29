@@ -961,9 +961,22 @@ class OneSidedPressureController:
                 # A flat trace may only grow the probe after the commanded gas
                 # ramp plus a separate dead-time observation window. This is
                 # intentionally stricter than the ordinary settle blackout.
+                # Shortened while this step started below the low-pressure
+                # ceiling (see low_pressure_probe_membrane_ceiling_mpa) --
+                # a real response is even less likely there, so less time
+                # needs to be spent ruling one out before growing the probe.
+                no_response_wait_s = gain_cfg.adaptive_no_response_wait_s
+                if (
+                    gain_cfg.low_pressure_probe_membrane_ceiling_mpa is not None
+                    and step.membrane_actual_before is not None
+                    and step.membrane_actual_before < gain_cfg.low_pressure_probe_membrane_ceiling_mpa
+                ):
+                    no_response_wait_s = min(
+                        no_response_wait_s, gain_cfg.low_pressure_probe_no_response_wait_s
+                    )
                 no_response_observation_elapsed = (
                     now - response_start_t
-                    >= ramp_time_s + gain_cfg.adaptive_no_response_wait_s
+                    >= ramp_time_s + no_response_wait_s
                 )
 
         # A flat slope only means "settled" if the membrane has actually
@@ -1128,6 +1141,19 @@ class OneSidedPressureController:
                 requested_sample_step
                 / gain_cfg.adaptive_probe_max_expected_gain
             )
+            current_membrane_actual = (
+                self._membrane_status.pressure_mpa
+                if self._membrane_status is not None
+                else None
+            )
+            if (
+                gain_cfg.low_pressure_probe_membrane_ceiling_mpa is not None
+                and current_membrane_actual is not None
+                and current_membrane_actual < gain_cfg.low_pressure_probe_membrane_ceiling_mpa
+            ):
+                probe_target_cap_mpa = max(
+                    probe_target_cap_mpa, gain_cfg.low_pressure_probe_max_step_mpa
+                )
             membrane_step = min(
                 self._adaptive_next_probe_step_mpa,
                 gain_cfg.max_probe_step_mpa,
@@ -1228,6 +1254,8 @@ class OneSidedPressureController:
             "gain_uncertainty": gain_est.gain_uncertainty,
             "safe_gain": safe_gain,
             "local_gain_trend_per_gpa": gain_est.local_gain_trend_per_gpa,
+            "local_observation_span_gpa": gain_est.local_observation_span_gpa,
+            "gain_n_samples": gain_est.n_samples,
             "rate_limit_gain": gain_est.rate_limit_gain,
             "rate_gain_source": gain_est.rate_gain_source,
             "interrupted_rate_observation_count": (

@@ -163,6 +163,7 @@ class GainEstimator:
             interrupted_rate_observation_count=observation_count,
             learned_rate_floor=learned_floor,
             local_gain_trend_per_gpa=estimate.local_gain_trend_per_gpa,
+            local_observation_span_gpa=estimate.local_observation_span_gpa,
         )
 
     def _estimate_adaptive_local(
@@ -195,13 +196,27 @@ class GainEstimator:
         spread = statistics.pstdev(gains) if len(gains) >= 2 else 0.0
         uncertainty = max(spread, upper - median_gain, 0.0)
 
-        trend = 0.0
+        # A per-GPa curvature trend needs enough pressure spread across the
+        # window to mean anything -- fit through *all* local candidates
+        # (least squares, not just the two most recent) and only trust the
+        # resulting slope once the window's observations span at least
+        # local_trend_min_span_gpa. Below that span, ordinary observed_gain
+        # noise (from a short settle window / measurement std comparable to
+        # the step's own sample-pressure delta) divided by a tiny pressure
+        # gap produces an arbitrarily large apparent slope with no relation
+        # to the plant's real curvature -- see local_trend_min_span_gpa's
+        # docstring in config.py for the real-hardware run that exposed this.
         ordered = sorted(candidates, key=lambda item: (item[1], item[0]))
-        for (_, p0, g0), (_, p1, g1) in zip(ordered, ordered[1:]):
-            dp = p1 - p0
-            if dp > 0:
-                trend = max(trend, (g1 - g0) / dp)
-        trend = max(trend, 0.0)
+        span = ordered[-1][1] - ordered[0][1]
+        trend = 0.0
+        if span >= self._cfg.local_trend_min_span_gpa:
+            n = len(ordered)
+            p_mean = sum(p for _, p, _ in ordered) / n
+            g_mean = sum(g for _, _, g in ordered) / n
+            covariance = sum((p - p_mean) * (g - g_mean) for _, p, g in ordered)
+            variance = sum((p - p_mean) ** 2 for _, p, _ in ordered)
+            if variance > 0:
+                trend = max(0.0, covariance / variance)
 
         latest_gain = candidates[-1][2]
         local_upper = max(
@@ -225,6 +240,7 @@ class GainEstimator:
             rate_limit_gain=safe_gain,
             rate_gain_source="settled",
             local_gain_trend_per_gpa=trend,
+            local_observation_span_gpa=span,
         )
         return self._with_rate_limit(estimate, sample_pressure_gpa, 0.0)
 

@@ -34,7 +34,7 @@ def test_default_yaml_loads_cleanly():
     assert config.gain_estimation.step_sizing_mode == "adaptive_local"
     assert config.gain_estimation.interrupted_rate_learning_mode == "enforce"
     assert config.gain_estimation.interrupted_rate_safety_factor == 1.25
-    assert config.gain_estimation.adaptive_probe_max_expected_gain == 5.0
+    assert config.gain_estimation.adaptive_probe_max_expected_gain == 1.0
     assert config.gain_estimation.adaptive_no_response_wait_s == 30.0
     assert config.safety.setpoint_mismatch_grace_s == 0.0
     # Never a real secret committed to git (see CLAUDE.md); --sim needs no

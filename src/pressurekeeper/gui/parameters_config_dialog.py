@@ -383,6 +383,8 @@ class _GainEstimationEstimatorTab(QWidget):
         )
         self.local_curvature_safety_factor = _line(gain_estimation.local_curvature_safety_factor)
         form.addRow("local_curvature_safety_factor:", self.local_curvature_safety_factor)
+        self.local_trend_min_span_gpa = _line(gain_estimation.local_trend_min_span_gpa)
+        form.addRow("local_trend_min_span_gpa:", self.local_trend_min_span_gpa)
         self.response_detection_sigma = _line(gain_estimation.response_detection_sigma)
         form.addRow("response_detection_sigma:", self.response_detection_sigma)
         self.response_detection_floor_gpa = _line(gain_estimation.response_detection_floor_gpa)
@@ -504,6 +506,10 @@ class _GainEstimationEstimatorTab(QWidget):
                 "local_curvature_safety_factor": _req_float(
                     self.local_curvature_safety_factor,
                     "gain_estimation.local_curvature_safety_factor",
+                ),
+                "local_trend_min_span_gpa": _req_float(
+                    self.local_trend_min_span_gpa,
+                    "gain_estimation.local_trend_min_span_gpa",
                 ),
                 "response_detection_sigma": _req_float(
                     self.response_detection_sigma,
