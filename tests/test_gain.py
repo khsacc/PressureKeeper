@@ -135,3 +135,70 @@ def test_rate_limit_gain_never_falls_below_the_online_safe_gain_estimate():
     assert result.rate_limit_gain >= result.safe_gain
     assert result.rate_limit_gain == result.safe_gain, \
         "the online estimate already exceeds the configured floor, so it alone should govern"
+
+
+def test_interrupted_rate_observation_is_visible_but_not_enforced_in_observe_mode():
+    est = GainEstimator(GainEstimationConfig(
+        bin_width_gpa=0.5,
+        min_samples_for_estimate=3,
+        safety_factor=1.0,
+        upper_percentile=90.0,
+        neighbor_bins=0,
+        interrupted_rate_learning_mode="observe",
+        interrupted_rate_safety_factor=1.25,
+    ))
+    region = make_region(safe_gain=0.20)
+    est.record_interrupted_rate_observation(7, 0.3, 0.50)
+
+    result = est.estimate(0.3, region)
+    assert result.safe_gain == 0.20
+    assert result.rate_limit_gain == 0.20
+    assert result.learned_rate_floor == 0.625
+    assert result.interrupted_rate_observation_count == 1
+    assert result.rate_gain_source == "configured"
+
+
+def test_interrupted_rate_observation_only_tightens_rate_limit_in_enforce_mode():
+    est = GainEstimator(GainEstimationConfig(
+        bin_width_gpa=0.5,
+        min_samples_for_estimate=3,
+        safety_factor=1.0,
+        upper_percentile=90.0,
+        neighbor_bins=0,
+        interrupted_rate_learning_mode="enforce",
+        interrupted_rate_safety_factor=1.25,
+    ))
+    region = make_region(safe_gain=0.20)
+    est.record_interrupted_rate_observation(8, 0.3, 0.50)
+
+    result = est.estimate(0.3, region)
+    assert result.safe_gain == 0.20, "interrupted data must never resize static steps"
+    assert result.rate_limit_gain == 0.625
+    assert result.rate_gain_source == "interrupted"
+
+
+def test_interrupted_rate_observation_updates_in_place_propagates_upward_and_can_be_discarded():
+    est = GainEstimator(GainEstimationConfig(
+        bin_width_gpa=0.5,
+        min_samples_for_estimate=3,
+        safety_factor=1.0,
+        upper_percentile=90.0,
+        neighbor_bins=0,
+        interrupted_rate_learning_mode="enforce",
+        interrupted_rate_safety_factor=1.0,
+        interrupted_rate_propagate_upward=True,
+    ))
+    region = make_region(safe_gain=0.20)
+    est.record_interrupted_rate_observation(9, 0.3, 0.40)
+    est.record_interrupted_rate_observation(9, 0.3, 0.60)
+
+    same_bin = est.estimate(0.3, region)
+    higher_bin = est.estimate(1.3, region)
+    assert same_bin.interrupted_rate_observation_count == 1
+    assert same_bin.rate_limit_gain == 0.60
+    assert higher_bin.rate_limit_gain == 0.60
+
+    est.discard_interrupted_rate_observation(9)
+    discarded = est.estimate(0.3, region)
+    assert discarded.interrupted_rate_observation_count == 0
+    assert discarded.rate_limit_gain == region.safe_gain

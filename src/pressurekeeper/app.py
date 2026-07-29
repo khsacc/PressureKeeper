@@ -32,6 +32,12 @@ class AppContext:
     def close(self) -> None:
         if self.logger is not None:
             try:
+                self.controller.finalize_interrupted_observation(
+                    "application_context_closed"
+                )
+            except Exception:
+                pass
+            try:
                 self.logger.close()
             except Exception:
                 pass

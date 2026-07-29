@@ -175,6 +175,15 @@ gain_estimation:
   safety_factor: 1.0
   upper_percentile: 90.0
   neighbor_bins: 1
+  # Interrupted steps are kept out of settled/static gain estimation. A
+  # clean compression-rate-only PAUSE can still supply a conservative floor
+  # for the independent slew-rate limiter:
+  #   off     = do not retain an online floor
+  #   observe = calculate/log the floor without changing commands
+  #   enforce = apply the floor to subsequent membrane ramp rates
+  interrupted_rate_learning_mode: observe
+  interrupted_rate_safety_factor: 1.25
+  interrupted_rate_propagate_upward: true
 
 estimator:
   outlier_median_window: 7

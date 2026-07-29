@@ -5,6 +5,7 @@ physics is covered separately in test_scenarios.py.
 """
 from __future__ import annotations
 
+import csv
 from dataclasses import replace as dataclass_replace
 
 from pressurekeeper.errors import MembraneCommError
@@ -514,6 +515,133 @@ def test_max_compression_rate_uses_rate_limit_gain_not_safe_gain(tmp_path):
         f"effective rate must respect max_compression_rate_gpa_per_min / rate_limit_gain: {seen_rates} vs cap {expected_cap}"
     assert all(r < stale_cap_using_safe_gain for r in seen_rates), \
         "rate_limit_gain must actually tighten the cap below what plain safe_gain would have allowed"
+
+
+def test_clean_rate_pause_learns_threshold_tick_and_slows_next_command(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    enforce_config = controller.config.model_copy(update={
+        "gain_estimation": controller.config.gain_estimation.model_copy(update={
+            "interrupted_rate_learning_mode": "enforce",
+            "interrupted_rate_safety_factor": 1.25,
+        }),
+    })
+    controller.apply_config_update(enforce_config)
+    controller.set_max_compression_rate(0.5)
+
+    # Reach an actively driven pending step while the ruby pressure is flat.
+    for _ in range(30):
+        ruby.push(0.10)
+        tick(controller, clock)
+        if controller._pending_step is not None:
+            break
+    assert controller._pending_step is not None
+    first_step_id = controller._pending_step.step_id
+
+    # A smooth, valid rise trips only compression_rate_exceeded. The safety
+    # verdict runs before _advance(), so this specifically checks that the
+    # threshold-crossing tick is captured by the new pre-verdict observer.
+    snap = None
+    pressure = 0.10
+    for _ in range(20):
+        pressure += 0.015
+        ruby.push(pressure)
+        snap = tick(controller, clock)
+        if snap.state == ControlState.PAUSE:
+            break
+    assert snap is not None and snap.state == ControlState.PAUSE
+    observation = controller._interrupted_step_observation
+    assert observation is not None
+    assert observation.step_id == first_step_id
+    assert observation.eligible_for_rate_learning
+    assert observation.max_positive_slope_gpa_s * 60.0 > 0.5
+
+    learned = controller.gain_estimator.estimate(
+        observation.sizing_pressure_gpa,
+        controller.config.region_for(observation.sizing_pressure_gpa),
+    )
+    assert learned.rate_gain_source == "interrupted"
+    assert learned.rate_limit_gain == learned.learned_rate_floor
+    assert learned.safe_gain == controller.config.region_for(
+        observation.sizing_pressure_gpa
+    ).safe_gain
+
+    # Hold the ruby reading flat until the rate-only PAUSE clears. The same
+    # tick may issue the next approach command; it must use the learned floor.
+    for _ in range(80):
+        ruby.push(pressure)
+        snap = tick(controller, clock)
+        if (
+            snap.state != ControlState.PAUSE
+            and controller._last_command_decision is not None
+            and controller._last_command_decision.get("rate_gain_source")
+            == "interrupted"
+        ):
+            break
+    controller.finalize_interrupted_observation("test_complete")
+    logger.close()
+
+    assert controller._last_command_decision is not None
+    assert controller._last_command_decision["rate_gain_source"] == "interrupted"
+    expected_cap = 0.5 / controller._last_command_decision["learned_rate_floor"]
+    assert (
+        controller._last_command_decision["membrane_rate_mpa_per_min"]
+        <= expected_cap + 1e-9
+    )
+
+    with (logger.directory / "interrupted_steps.csv").open(
+        newline="", encoding="utf-8"
+    ) as f:
+        rows = list(csv.DictReader(f))
+    step_rows = [row for row in rows if int(row["step_id"]) == first_step_id]
+    assert [row["phase"] for row in step_rows] == ["started", "final"]
+    assert all(row["eligible_for_rate_learning"] == "True" for row in step_rows)
+
+
+def test_manual_pause_disqualifies_an_in_progress_rate_observation(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    enforce_config = controller.config.model_copy(update={
+        "gain_estimation": controller.config.gain_estimation.model_copy(update={
+            "interrupted_rate_learning_mode": "enforce",
+        }),
+    })
+    controller.apply_config_update(enforce_config)
+
+    for _ in range(30):
+        ruby.push(0.10)
+        tick(controller, clock)
+        if controller._pending_step is not None:
+            break
+    assert controller._pending_step is not None
+
+    pressure = 0.10
+    for _ in range(20):
+        pressure += 0.015
+        ruby.push(pressure)
+        snap = tick(controller, clock)
+        if snap.state == ControlState.PAUSE and controller._interrupted_step_observation:
+            break
+    observation = controller._interrupted_step_observation
+    assert observation is not None and observation.eligible_for_rate_learning
+    sizing_pressure = observation.sizing_pressure_gpa
+    region = controller.config.region_for(sizing_pressure)
+    assert controller.gain_estimator.estimate(
+        sizing_pressure, region
+    ).interrupted_rate_observation_count == 1
+
+    controller.pause("operator intervened during rate pause")
+    logger.close()
+
+    assert controller._interrupted_step_observation is None
+    after = controller.gain_estimator.estimate(sizing_pressure, region)
+    assert after.interrupted_rate_observation_count == 0
+    assert after.rate_gain_source != "interrupted"
+    with (logger.directory / "interrupted_steps.csv").open(
+        newline="", encoding="utf-8"
+    ) as f:
+        rows = list(csv.DictReader(f))
+    assert rows[-1]["phase"] == "final"
+    assert rows[-1]["eligible_for_rate_learning"] == "False"
+    assert "manual pause" in rows[-1]["exclusion_reason"]
 
 
 def test_set_membrane_rate_mpa_per_min_rejects_non_positive(tmp_path):

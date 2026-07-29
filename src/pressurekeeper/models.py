@@ -188,6 +188,50 @@ class StepRecord:
         return 0.5 * (self.sample_pressure_before + self.sample_pressure_after)
 
 
+@dataclass
+class InterruptedStepObservation:
+    """Audit and rate-learning record for a commanded step that did not settle.
+
+    Interrupted responses are deliberately kept separate from ``StepRecord``:
+    their final static gain is unknown, but a clean compression-rate pause
+    still provides a conservative lower bound for future slew-rate limiting.
+    """
+
+    step_id: int
+    cause_code: str
+    eligible_for_rate_learning: bool
+    exclusion_reason: str | None
+    t_command: float
+    t_drive_started: float | None
+    t_interrupted: float
+    sizing_pressure_gpa: float
+    sample_pressure_before: float
+    sample_pressure_at_interrupt: float | None
+    max_sample_pressure_gpa: float | None
+    max_positive_slope_gpa_s: float
+    commanded_membrane_rate_mpa_per_min: float | None
+    membrane_pressure_before: float
+    membrane_pressure_after: float
+    membrane_actual_at_interrupt: float | None
+    max_membrane_actual_mpa: float | None
+    ack_uncertain: bool
+    t_observation_end: float | None = None
+    observation_end_reason: str | None = None
+
+    @property
+    def raw_rate_gain(self) -> float | None:
+        rate = self.commanded_membrane_rate_mpa_per_min
+        if (
+            rate is None
+            or not math.isfinite(rate)
+            or rate <= 0
+            or not math.isfinite(self.max_positive_slope_gpa_s)
+            or self.max_positive_slope_gpa_s <= 0
+        ):
+            return None
+        return self.max_positive_slope_gpa_s * 60.0 / rate
+
+
 @dataclass(frozen=True)
 class GainEstimate:
     safe_gain: float
@@ -196,6 +240,9 @@ class GainEstimate:
     source: Literal["prior", "observed"]
     n_samples: int
     rate_limit_gain: float
+    rate_gain_source: Literal["configured", "settled", "interrupted"] = "configured"
+    interrupted_rate_observation_count: int = 0
+    learned_rate_floor: float = 0.0
 
 
 @dataclass(frozen=True)

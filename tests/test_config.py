@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from pressurekeeper.clients.ruby_client import RubyPressureClient
 from pressurekeeper.config import (
     ControlConfig,
+    GainEstimationConfig,
     RubyAcquisitionConfig,
     RubyApiConfig,
     SafetyConfig,
@@ -30,12 +31,22 @@ def test_default_yaml_loads_cleanly():
     assert config.ruby_api.acquisition.configuration_id is None
     assert config.ruby_api.acquisition.axis_mode is None
     assert config.approach.max_compression_rate_gpa_per_min == 0.5
+    assert config.gain_estimation.interrupted_rate_learning_mode == "observe"
+    assert config.gain_estimation.interrupted_rate_safety_factor == 1.25
     assert config.safety.setpoint_mismatch_grace_s == 0.0
     # Never a real secret committed to git (see CLAUDE.md); --sim needs no
     # config at all, so this is a harmless literal placeholder rather than
     # a "${...}" that load_config() would insist on resolving.
     assert config.ruby_api.api_key == "REPLACE_ME_SITE_SPECIFIC_RUBY_API_KEY"
     assert config.pace5000_api.api_key is None
+
+
+def test_interrupted_rate_learning_config_rejects_unsafe_or_unknown_values():
+    GainEstimationConfig(interrupted_rate_learning_mode="enforce")
+    with pytest.raises(ValidationError):
+        GainEstimationConfig(interrupted_rate_learning_mode="automatic")
+    with pytest.raises(ValidationError):
+        GainEstimationConfig(interrupted_rate_safety_factor=0.99)
 
 
 def test_env_var_placeholder_is_expanded(tmp_path, monkeypatch):

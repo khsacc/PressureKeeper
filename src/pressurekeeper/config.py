@@ -163,6 +163,13 @@ class GainEstimationConfig(BaseModel):
     safety_factor: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     upper_percentile: float = Field(default=90.0, gt=50.0, lt=100.0)
     neighbor_bins: int = Field(default=1, ge=0)
+    # Interrupted steps are never mixed into the settled/static-gain data.
+    # They can, however, provide a conservative lower bound for the separate
+    # dynamic slew-rate limiter. ``observe`` computes/logs that bound without
+    # changing commands; ``enforce`` applies it to subsequent commands.
+    interrupted_rate_learning_mode: Literal["off", "observe", "enforce"] = "observe"
+    interrupted_rate_safety_factor: float = Field(default=1.25, ge=1.0, allow_inf_nan=False)
+    interrupted_rate_propagate_upward: bool = True
 
 
 class EstimatorConfig(BaseModel):

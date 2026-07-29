@@ -24,6 +24,7 @@ from .logging_sink import DataLogger
 from .models import (
     ControllerSnapshot,
     ControlState,
+    InterruptedStepObservation,
     MembraneStatus,
     SafetyEvent,
     SafetyVerdict,
@@ -76,6 +77,7 @@ class OneSidedPressureController:
         self._last_membrane_poll_t: float | None = None
         self._pending_step: StepRecord | None = None
         self._staged_rearm_step: StepRecord | None = None
+        self._interrupted_step_observation: InterruptedStepObservation | None = None
         self._next_step_id = 1
         self._settled_since: float | None = None
         self._prior_state_before_pause: ControlState | None = None
@@ -223,7 +225,16 @@ class OneSidedPressureController:
                 floor = self._target_reduction_resume_floor_gpa
                 self._target_reduction_resume_floor_gpa = old_target if floor is None else max(floor, old_target)
                 self._safety.set_membrane_stop_intended(True)
-                self._abandon_motion(self._clock.now(), "target reduction interrupted the active/staged step")
+                now = self._clock.now()
+                self._disqualify_interrupted_rate_learning(
+                    "target reduction contaminated the interrupted response"
+                )
+                self._abandon_motion(
+                    now,
+                    "target reduction interrupted the active/staged step",
+                    cause_code="target_reduced",
+                )
+                self._finalize_interrupted_step(now, "target_reduced")
                 self._rate_pause_eligible = False
                 self._rate_pause_holding = False
                 self._rate_pause_hold_setpoint = None
@@ -299,7 +310,12 @@ class OneSidedPressureController:
         self._safety.set_membrane_stop_intended(True)
         self._emergency_stop_attempt()
         with self._lock:
-            self._abandon_motion(self._clock.now(), reason)
+            now = self._clock.now()
+            self._disqualify_interrupted_rate_learning(
+                "manual pause contaminated the interrupted response"
+            )
+            self._abandon_motion(now, reason, cause_code="manual_pause")
+            self._finalize_interrupted_step(now, "manual_pause")
             self._rate_pause_holding = False
             self._rate_pause_hold_setpoint = None
 
@@ -311,7 +327,12 @@ class OneSidedPressureController:
         self._safety.set_membrane_stop_intended(True)
         self._emergency_stop_attempt()
         with self._lock:
-            self._abandon_motion(self._clock.now(), reason)
+            now = self._clock.now()
+            self._disqualify_interrupted_rate_learning(
+                "manual abort contaminated the interrupted response"
+            )
+            self._abandon_motion(now, reason, cause_code="manual_abort")
+            self._finalize_interrupted_step(now, "manual_abort")
             self._rate_pause_holding = False
             self._rate_pause_hold_setpoint = None
 
@@ -325,7 +346,12 @@ class OneSidedPressureController:
             self._safety.force_reset()
             self._safety.set_membrane_stop_intended(True)
             self.state = ControlState.APPROACH
-            self._abandon_motion(self._clock.now(), "operator reset")
+            now = self._clock.now()
+            self._disqualify_interrupted_rate_learning(
+                "operator reset contaminated the interrupted response"
+            )
+            self._abandon_motion(now, "operator reset", cause_code="operator_reset")
+            self._finalize_interrupted_step(now, "operator_reset")
             self._rate_pause_holding = False
             self._rate_pause_hold_setpoint = None
             self._prior_state_before_pause = None
@@ -460,6 +486,12 @@ class OneSidedPressureController:
                 status = replace(status, control_mode=self._dry_run_driving_believed)
 
             self._membrane_status = status
+            # Capture the current sample before SafetySupervisor can interrupt
+            # and detach the pending step. Previously the threshold-crossing
+            # tick itself was lost because response tracking happened later,
+            # inside _advance(), only on safety-ok ticks.
+            self._observe_active_step(now)
+            self._observe_interrupted_step(now)
 
             verdict = self._safety.evaluate(
                 self._estimator, status, now, extra_events,
@@ -486,7 +518,13 @@ class OneSidedPressureController:
     def _apply_verdict(self, verdict: SafetyVerdict, now: float) -> None:
         if verdict.level == "abort":
             self._safety.set_membrane_stop_intended(True)
-            self._abandon_motion(now, "safety abort interrupted the active/staged step")
+            self._disqualify_interrupted_rate_learning("safety abort contaminated the response")
+            self._abandon_motion(
+                now,
+                "safety abort interrupted the active/staged step",
+                cause_code="safety_abort",
+            )
+            self._finalize_interrupted_step(now, "safety_abort")
             self._rate_pause_holding = False
             self._rate_pause_hold_setpoint = None
             self._set_state(ControlState.ABORT, now, "safety abort")
@@ -521,6 +559,10 @@ class OneSidedPressureController:
                 and not self._safety.comm_errors_recent(now, self._cfg.estimator.slope_window_s)
             )
             self._rate_pause_eligible = self._rate_pause_eligible and rate_only_this_tick
+            if not self._rate_pause_eligible:
+                self._disqualify_interrupted_rate_learning(
+                    "PAUSE episode was not caused solely by compression_rate_exceeded"
+                )
             if self._rate_pause_eligible and self._rate_pause_holding:
                 pass
             else:
@@ -528,7 +570,16 @@ class OneSidedPressureController:
                     self._rate_pause_holding = False
                     self._rate_pause_hold_setpoint = None
                 self._safety.set_membrane_stop_intended(True)
-                self._abandon_motion(now, "pause interrupted the active/staged step")
+                self._abandon_motion(
+                    now,
+                    "pause interrupted the active/staged step",
+                    cause_code=(
+                        "compression_rate_exceeded"
+                        if self._rate_pause_eligible
+                        else "safety_pause"
+                    ),
+                    eligible_for_rate_learning=self._rate_pause_eligible,
+                )
                 if self._rate_pause_eligible:
                     self._try_hold_at_current_pressure(now)
             reason = "; ".join(e.message for e in verdict.events) or "paused"
@@ -540,6 +591,7 @@ class OneSidedPressureController:
             self._rate_pause_holding = False
             self._rate_pause_hold_setpoint = None
             if self.state == ControlState.PAUSE:
+                self._finalize_interrupted_step(now, "safety_condition_cleared")
                 resumed = self._prior_state_before_pause or ControlState.APPROACH
                 self._prior_state_before_pause = None
                 if resumed == ControlState.SETTLE:
@@ -761,18 +813,30 @@ class OneSidedPressureController:
         hyst = self._cfg.hysteresis
         if self._target_reduction_hold:
             self._safety.set_membrane_stop_intended(True)
-            self._abandon_motion(now, "target reduction entered HOLD")
+            self._abandon_motion(
+                now,
+                "target reduction entered HOLD",
+                cause_code="target_reduced",
+            )
             self._set_state(ControlState.HOLD, now, "target was lowered; one-sided control remains stopped")
             return
         if sizing_pressure > target + hyst.overshoot_margin_gpa:
             self._safety.set_membrane_stop_intended(True)
-            self._abandon_motion(now, "sample pressure exceeded target")
+            self._abandon_motion(
+                now,
+                "sample pressure exceeded target",
+                cause_code="target_overshoot",
+            )
             self._set_state(ControlState.HOLD, now, "sample pressure above target + overshoot margin")
             return
 
         if predicted >= target - hyst.reach_margin_gpa:
             self._safety.set_membrane_stop_intended(True)
-            self._abandon_motion(now, "target reach prediction entered HOLD")
+            self._abandon_motion(
+                now,
+                "target reach prediction entered HOLD",
+                cause_code="target_reach_prediction",
+            )
             self._set_state(ControlState.HOLD, now, "predicted pressure within reach margin of target")
             return
 
@@ -824,7 +888,6 @@ class OneSidedPressureController:
     def _update_pending_step(self, filtered: float, slope: float, now: float) -> None:
         step = self._pending_step
         assert step is not None
-        step.max_slope_gpa_s = max(step.max_slope_gpa_s, slope)
 
         region = self._cfg.region_for(filtered)
         threshold = region.settled_slope_threshold_gpa_s
@@ -1006,6 +1069,11 @@ class OneSidedPressureController:
             "gain_uncertainty": gain_est.gain_uncertainty,
             "safe_gain": safe_gain,
             "rate_limit_gain": gain_est.rate_limit_gain,
+            "rate_gain_source": gain_est.rate_gain_source,
+            "interrupted_rate_observation_count": (
+                gain_est.interrupted_rate_observation_count
+            ),
+            "learned_rate_floor": gain_est.learned_rate_floor,
             "requested_sample_step_gpa": requested_sample_step,
             "membrane_step_mpa": membrane_step,
             "membrane_rate_mpa_per_min": effective_rate_mpa_per_min,
@@ -1172,29 +1240,218 @@ class OneSidedPressureController:
         self._safety.set_membrane_stop_intended(False)
         self._set_state(ControlState.SETTLE, now, "safe staged setpoint confirmed; enabling Control")
 
-    def _abandon_motion(self, now: float, reason: str) -> None:
-        """Forget response tracking whenever Measure interrupts a ramp.
-
-        The physical command budget remains charged in SafetySupervisor; only
-        the now-invalid settle/gain observation is discarded.
-        """
-        if self._pending_step is None and self._staged_rearm_step is None:
-            self._settled_since = None
+    def _observe_active_step(self, now: float) -> None:
+        """Capture response extrema before this tick's safety verdict."""
+        step = self._pending_step
+        if step is None:
             return
-        abandoned_ids = [
-            step.step_id
+        slope = self._estimator.pressure_slope()
+        if slope is not None and math.isfinite(slope):
+            step.max_slope_gpa_s = max(step.max_slope_gpa_s, slope)
+
+    def _observe_interrupted_step(self, now: float) -> None:
+        observation = self._interrupted_step_observation
+        if observation is None:
+            return
+        filtered = self._estimator.filtered_pressure()
+        if filtered is not None and math.isfinite(filtered):
+            if (
+                observation.max_sample_pressure_gpa is None
+                or filtered > observation.max_sample_pressure_gpa
+            ):
+                observation.max_sample_pressure_gpa = filtered
+        slope = self._estimator.pressure_slope()
+        if slope is not None and math.isfinite(slope):
+            observation.max_positive_slope_gpa_s = max(
+                observation.max_positive_slope_gpa_s,
+                slope,
+            )
+        status = self._membrane_status
+        actual = status.pressure_mpa if status is not None else None
+        if actual is not None and math.isfinite(actual):
+            if (
+                observation.max_membrane_actual_mpa is None
+                or actual > observation.max_membrane_actual_mpa
+            ):
+                observation.max_membrane_actual_mpa = actual
+        self._update_interrupted_rate_learning(observation)
+
+    def _update_interrupted_rate_learning(
+        self,
+        observation: InterruptedStepObservation,
+    ) -> None:
+        raw_rate_gain = observation.raw_rate_gain
+        if not observation.eligible_for_rate_learning or raw_rate_gain is None:
+            return
+        self._gain_estimator.record_interrupted_rate_observation(
+            observation.step_id,
+            observation.sizing_pressure_gpa,
+            raw_rate_gain,
+        )
+
+    def _disqualify_interrupted_rate_learning(self, reason: str) -> None:
+        observation = self._interrupted_step_observation
+        if observation is None or not observation.eligible_for_rate_learning:
+            return
+        observation.eligible_for_rate_learning = False
+        observation.exclusion_reason = reason
+        self._gain_estimator.discard_interrupted_rate_observation(observation.step_id)
+
+    def _finalize_interrupted_step(self, now: float, reason: str) -> None:
+        observation = self._interrupted_step_observation
+        if observation is None:
+            return
+        self._observe_interrupted_step(now)
+        observation.t_observation_end = now
+        observation.observation_end_reason = reason
+        if self._logger is not None:
+            factor = self._cfg.gain_estimation.interrupted_rate_safety_factor
+            self._safe_call(
+                lambda: self._logger.log_interrupted_step(
+                    observation,
+                    phase="final",
+                    safety_factor=factor,
+                )
+            )
+        self._interrupted_step_observation = None
+
+    def finalize_interrupted_observation(
+        self,
+        reason: str = "controller_shutdown",
+    ) -> None:
+        """Flush an in-progress interrupted response before its logger closes."""
+        with self._lock:
+            self._finalize_interrupted_step(self._clock.now(), reason)
+
+    def _abandon_motion(
+        self,
+        now: float,
+        reason: str,
+        *,
+        cause_code: str = "other",
+        eligible_for_rate_learning: bool = False,
+    ) -> None:
+        """Detach an interrupted step while retaining safe rate evidence.
+
+        The physical command budget remains charged in SafetySupervisor.
+        Settled/static-gain learning remains forbidden; only a clean,
+        acknowledged compression-rate-only interruption can update the
+        separate dynamic slew-rate floor.
+        """
+        steps = [
+            step
             for step in (self._pending_step, self._staged_rearm_step)
             if step is not None
         ]
+        if not steps:
+            self._settled_since = None
+            return
+
         self._pending_step = None
         self._staged_rearm_step = None
         self._settled_since = None
+        abandoned_ids = [step.step_id for step in steps]
         self._log_event(SafetyEvent(
             now,
             "step_tracking_abandoned",
             "info",
             f"discarded interrupted step tracking {abandoned_ids}: {reason}",
         ))
+
+        for step in steps:
+            if self._interrupted_step_observation is not None:
+                self._disqualify_interrupted_rate_learning(
+                    "a later interrupted step replaced this observation"
+                )
+                self._finalize_interrupted_step(now, "replaced_by_later_interruption")
+
+            filtered = self._estimator.filtered_pressure()
+            slope = self._estimator.pressure_slope()
+            status = self._membrane_status
+            actual = status.pressure_mpa if status is not None else None
+            commanded_rate = step.decision.get("membrane_rate_mpa_per_min")
+            sizing_pressure = step.decision.get(
+                "sizing_pressure_gpa",
+                step.sample_pressure_before,
+            )
+
+            exclusion_reasons: list[str] = []
+            if not eligible_for_rate_learning:
+                exclusion_reasons.append(
+                    "interruption was not a clean compression-rate-only pause"
+                )
+            if (
+                step.decision.get("staged_in_measure")
+                and step.t_drive_started is None
+            ):
+                exclusion_reasons.append("staged step never entered Control")
+            if step.ack_uncertain:
+                exclusion_reasons.append("command acknowledgement was uncertain")
+            if not self._estimator.is_valid(now):
+                exclusion_reasons.append("pressure estimator was invalid")
+            if commanded_rate is None or not math.isfinite(commanded_rate) or commanded_rate <= 0:
+                exclusion_reasons.append("commanded membrane rate was unavailable")
+            if actual is None or not math.isfinite(actual):
+                exclusion_reasons.append("actual membrane pressure was unavailable")
+            if slope is None or not math.isfinite(slope) or slope <= 0:
+                exclusion_reasons.append("positive sample-pressure slope was unavailable")
+
+            eligible = eligible_for_rate_learning and not exclusion_reasons
+            sample_at_interrupt = (
+                filtered
+                if filtered is not None and math.isfinite(filtered)
+                else None
+            )
+            actual_at_interrupt = (
+                actual
+                if actual is not None and math.isfinite(actual)
+                else None
+            )
+            observation = InterruptedStepObservation(
+                step_id=step.step_id,
+                cause_code=cause_code,
+                eligible_for_rate_learning=eligible,
+                exclusion_reason=(
+                    None if eligible else "; ".join(exclusion_reasons)
+                ),
+                t_command=step.t_command,
+                t_drive_started=step.t_drive_started,
+                t_interrupted=now,
+                sizing_pressure_gpa=float(sizing_pressure),
+                sample_pressure_before=step.sample_pressure_before,
+                sample_pressure_at_interrupt=sample_at_interrupt,
+                max_sample_pressure_gpa=sample_at_interrupt,
+                max_positive_slope_gpa_s=max(
+                    step.max_slope_gpa_s,
+                    slope if slope is not None and math.isfinite(slope) else 0.0,
+                ),
+                commanded_membrane_rate_mpa_per_min=(
+                    float(commanded_rate)
+                    if commanded_rate is not None and math.isfinite(commanded_rate)
+                    else None
+                ),
+                membrane_pressure_before=step.membrane_pressure_before,
+                membrane_pressure_after=step.membrane_pressure_after,
+                membrane_actual_at_interrupt=actual_at_interrupt,
+                max_membrane_actual_mpa=actual_at_interrupt,
+                ack_uncertain=step.ack_uncertain,
+            )
+            self._interrupted_step_observation = observation
+            self._update_interrupted_rate_learning(observation)
+            if self._logger is not None:
+                factor = self._cfg.gain_estimation.interrupted_rate_safety_factor
+                self._safe_call(
+                    lambda obs=observation: self._logger.log_interrupted_step(
+                        obs,
+                        phase="started",
+                        safety_factor=factor,
+                    )
+                )
+
+            # Only a clean rate-only PAUSE has a meaningful tail episode.
+            # Other interruption causes are complete audit records immediately.
+            if not eligible:
+                self._finalize_interrupted_step(now, cause_code)
 
     def _conservative_sample_pressure(self, filtered: float) -> float:
         """Upper pressure bound used for one-sided command decisions.

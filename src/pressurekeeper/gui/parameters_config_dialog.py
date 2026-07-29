@@ -363,6 +363,26 @@ class _GainEstimationEstimatorTab(QWidget):
         form.addRow("upper_percentile (50-100):", self.upper_percentile)
         self.neighbor_bins = _line(gain_estimation.neighbor_bins)
         form.addRow("neighbor_bins:", self.neighbor_bins)
+        self.interrupted_rate_learning_mode = _combo(
+            ["off", "observe", "enforce"],
+            gain_estimation.interrupted_rate_learning_mode,
+        )
+        form.addRow("interrupted_rate_learning_mode:", self.interrupted_rate_learning_mode)
+        self.interrupted_rate_safety_factor = _line(
+            gain_estimation.interrupted_rate_safety_factor
+        )
+        form.addRow(
+            "interrupted_rate_safety_factor (>= 1):",
+            self.interrupted_rate_safety_factor,
+        )
+        self.interrupted_rate_propagate_upward = QCheckBox()
+        self.interrupted_rate_propagate_upward.setChecked(
+            gain_estimation.interrupted_rate_propagate_upward
+        )
+        form.addRow(
+            "interrupted_rate_propagate_upward:",
+            self.interrupted_rate_propagate_upward,
+        )
 
         form.addRow(QLabel("--- estimator ---"))
         self.outlier_median_window = _line(estimator.outlier_median_window)
@@ -390,6 +410,14 @@ class _GainEstimationEstimatorTab(QWidget):
                 "safety_factor": _req_float(self.safety_factor, "gain_estimation.safety_factor"),
                 "upper_percentile": _req_float(self.upper_percentile, "gain_estimation.upper_percentile"),
                 "neighbor_bins": _req_int(self.neighbor_bins, "gain_estimation.neighbor_bins"),
+                "interrupted_rate_learning_mode": self.interrupted_rate_learning_mode.currentText(),
+                "interrupted_rate_safety_factor": _req_float(
+                    self.interrupted_rate_safety_factor,
+                    "gain_estimation.interrupted_rate_safety_factor",
+                ),
+                "interrupted_rate_propagate_upward": (
+                    self.interrupted_rate_propagate_upward.isChecked()
+                ),
             },
             "estimator": {
                 "outlier_median_window": _req_int(self.outlier_median_window, "estimator.outlier_median_window"),

@@ -175,6 +175,17 @@ and it never fires close enough to target that `HOLD`'s own hysteresis would
 have handled it anyway. It only ever writes once per episode — Control, once
 re-armed against a fixed setpoint, keeps holding it without further writes.
 
+An interrupted step is never mixed into the settled/static gain data used to
+size pressure steps. A clean compression-rate-only interruption is instead
+tracked through the end of its PAUSE episode and written to
+`interrupted_steps.csv`. Its peak sample-pressure slope divided by the
+commanded membrane slew supplies a conservative lower bound for the separate
+rate limiter. `gain_estimation.interrupted_rate_learning_mode` controls
+whether this is disabled (`off`), audit-only (`observe`, the default), or
+applied to later commands in the same run (`enforce`). Any overlapping
+communication, sensor, manual-pause, or abort condition disqualifies and
+removes the online observation.
+
 Lowering a target while a step is in flight immediately enters `HOLD` and
 STOPs the output. Because normal control is one-sided and STOP does not lower
 the old device setpoint, the controller will not re-arm that old setpoint for

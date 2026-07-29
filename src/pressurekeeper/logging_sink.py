@@ -1,15 +1,17 @@
 """DataLogger: time-series CSV logging.
 
-Four files per run, all timestamp-keyed so they can be joined in analysis:
+Five files per run, all timestamp-keyed so they can be joined in analysis:
   * ticks.csv     — one row per control-loop iteration (§ログ requirements)
   * commands.csv  — one row per PACE5000 write, with the reason and every
                      control-decision value that produced it
   * steps.csv     — one row per settled step (before/after, response time,
                      observed gain) — the online sensitivity data set
+  * interrupted_steps.csv — start/final records for steps interrupted before
+                     settling, including rate-learning eligibility
   * events.csv    — safety events and state transitions
 
 Plus manifest.json, a small run-level record (git SHA, mode, whether Control
-was ever started, and how the run ended) -- unlike the four CSVs above, this
+was ever started, and how the run ended) -- unlike the five CSVs above, this
 is written even when a run never produces a single tick (e.g. the operator
 opened the GUI and closed it without pressing Start, or the very first
 step() call raised before anything else could log), so a completely empty
@@ -38,7 +40,13 @@ from pathlib import Path
 from typing import TextIO
 
 from .config import LoggingConfig
-from .models import ControllerSnapshot, SafetyEvent, StateTransition, StepRecord
+from .models import (
+    ControllerSnapshot,
+    InterruptedStepObservation,
+    SafetyEvent,
+    StateTransition,
+    StepRecord,
+)
 
 
 def _git_sha() -> str | None:
@@ -81,6 +89,7 @@ _COMMAND_FIELDS = [
     "sample_pressure_before", "filtered_pressure_gpa", "sizing_pressure_gpa", "pressure_slope_gpa_s",
     "predicted_pressure_gpa", "control_target_gpa", "predicted_error_gpa",
     "gain_source", "estimated_gain", "gain_uncertainty", "safe_gain", "rate_limit_gain",
+    "rate_gain_source", "interrupted_rate_observation_count", "learned_rate_floor",
     "requested_sample_step_gpa", "region_min_gpa", "region_max_gpa",
     "source_pressure_positive_mpa", "staged_in_measure",
 ]
@@ -90,6 +99,20 @@ _STEP_FIELDS = [
     "membrane_pressure_before", "membrane_pressure_after",
     "sample_pressure_before", "sample_pressure_after",
     "response_time_s", "max_slope_gpa_s", "measurement_std_gpa", "observed_gain",
+]
+
+_INTERRUPTED_STEP_FIELDS = [
+    "t_mono", "t_wall", "phase", "step_id", "cause_code",
+    "eligible_for_rate_learning", "exclusion_reason",
+    "t_command", "t_drive_started", "t_interrupted", "t_observation_end",
+    "observation_end_reason", "sizing_pressure_gpa",
+    "sample_pressure_before", "sample_pressure_at_interrupt",
+    "max_sample_pressure_gpa", "max_slope_gpa_s",
+    "commanded_membrane_rate_mpa_per_min", "raw_rate_gain",
+    "applied_safety_factor", "learned_rate_floor",
+    "membrane_pressure_before", "membrane_pressure_after",
+    "membrane_actual_at_interrupt", "max_membrane_actual_mpa",
+    "ack_uncertain",
 ]
 
 _EVENT_FIELDS = ["t_mono", "t_wall", "kind", "code", "severity", "message", "from_state", "to_state"]
@@ -109,6 +132,7 @@ class DataLogger:
             "pid": os.getpid(),
             "git_sha": _git_sha(),
             "mode": mode,
+            "log_schema_version": 2,
             "started_at_wall": time.time(),
             "started_control": False,
             "ended_at_wall": None,
@@ -125,14 +149,28 @@ class DataLogger:
             opened.append(self._command_f)
             self._step_f = self._open("steps.csv", _STEP_FIELDS)
             opened.append(self._step_f)
+            self._interrupted_step_f = self._open(
+                "interrupted_steps.csv", _INTERRUPTED_STEP_FIELDS
+            )
+            opened.append(self._interrupted_step_f)
             self._event_f = self._open("events.csv", _EVENT_FIELDS)
             opened.append(self._event_f)
 
             self._tick_w = csv.DictWriter(self._tick_f, fieldnames=_TICK_FIELDS)
             self._command_w = csv.DictWriter(self._command_f, fieldnames=_COMMAND_FIELDS)
             self._step_w = csv.DictWriter(self._step_f, fieldnames=_STEP_FIELDS)
+            self._interrupted_step_w = csv.DictWriter(
+                self._interrupted_step_f,
+                fieldnames=_INTERRUPTED_STEP_FIELDS,
+            )
             self._event_w = csv.DictWriter(self._event_f, fieldnames=_EVENT_FIELDS)
-            for writer in (self._tick_w, self._command_w, self._step_w, self._event_w):
+            for writer in (
+                self._tick_w,
+                self._command_w,
+                self._step_w,
+                self._interrupted_step_w,
+                self._event_w,
+            ):
                 writer.writeheader()
         except Exception:
             for file in opened:
@@ -220,6 +258,11 @@ class DataLogger:
             "gain_uncertainty": d.get("gain_uncertainty"),
             "safe_gain": d.get("safe_gain"),
             "rate_limit_gain": d.get("rate_limit_gain"),
+            "rate_gain_source": d.get("rate_gain_source"),
+            "interrupted_rate_observation_count": d.get(
+                "interrupted_rate_observation_count"
+            ),
+            "learned_rate_floor": d.get("learned_rate_floor"),
             "requested_sample_step_gpa": d.get("requested_sample_step_gpa"),
             "region_min_gpa": d.get("region_min_gpa"),
             "region_max_gpa": d.get("region_max_gpa"),
@@ -241,6 +284,55 @@ class DataLogger:
             "max_slope_gpa_s": step.max_slope_gpa_s,
             "measurement_std_gpa": step.measurement_std_gpa,
             "observed_gain": step.observed_gain,
+        })
+        self._maybe_flush()
+
+    def log_interrupted_step(
+        self,
+        observation: InterruptedStepObservation,
+        *,
+        phase: str,
+        safety_factor: float,
+    ) -> None:
+        raw_rate_gain = observation.raw_rate_gain
+        learned_rate_floor = (
+            raw_rate_gain * safety_factor
+            if raw_rate_gain is not None
+            else None
+        )
+        self._interrupted_step_w.writerow({
+            "t_mono": (
+                observation.t_interrupted
+                if phase == "started"
+                else observation.t_observation_end
+            ),
+            "t_wall": time.time(),
+            "phase": phase,
+            "step_id": observation.step_id,
+            "cause_code": observation.cause_code,
+            "eligible_for_rate_learning": observation.eligible_for_rate_learning,
+            "exclusion_reason": observation.exclusion_reason,
+            "t_command": observation.t_command,
+            "t_drive_started": observation.t_drive_started,
+            "t_interrupted": observation.t_interrupted,
+            "t_observation_end": observation.t_observation_end,
+            "observation_end_reason": observation.observation_end_reason,
+            "sizing_pressure_gpa": observation.sizing_pressure_gpa,
+            "sample_pressure_before": observation.sample_pressure_before,
+            "sample_pressure_at_interrupt": observation.sample_pressure_at_interrupt,
+            "max_sample_pressure_gpa": observation.max_sample_pressure_gpa,
+            "max_slope_gpa_s": observation.max_positive_slope_gpa_s,
+            "commanded_membrane_rate_mpa_per_min": (
+                observation.commanded_membrane_rate_mpa_per_min
+            ),
+            "raw_rate_gain": raw_rate_gain,
+            "applied_safety_factor": safety_factor,
+            "learned_rate_floor": learned_rate_floor,
+            "membrane_pressure_before": observation.membrane_pressure_before,
+            "membrane_pressure_after": observation.membrane_pressure_after,
+            "membrane_actual_at_interrupt": observation.membrane_actual_at_interrupt,
+            "max_membrane_actual_mpa": observation.max_membrane_actual_mpa,
+            "ack_uncertain": observation.ack_uncertain,
         })
         self._maybe_flush()
 
@@ -267,7 +359,13 @@ class DataLogger:
         self._n_since_flush += 1
         if self._n_since_flush >= self._flush_every:
             self._n_since_flush = 0
-            for f in (self._tick_f, self._command_f, self._step_f, self._event_f):
+            for f in (
+                self._tick_f,
+                self._command_f,
+                self._step_f,
+                self._interrupted_step_f,
+                self._event_f,
+            ):
                 f.flush()
 
     def close(self) -> None:
@@ -278,7 +376,13 @@ class DataLogger:
         # from a dead end into "this one was never started."
         if self._manifest["end_reason"] is None:
             self.mark_end("completed" if self._manifest["started_control"] else "not_started")
-        for f in (self._tick_f, self._command_f, self._step_f, self._event_f):
+        for f in (
+            self._tick_f,
+            self._command_f,
+            self._step_f,
+            self._interrupted_step_f,
+            self._event_f,
+        ):
             f.flush()
             f.close()
         self._write_summary_plot()
