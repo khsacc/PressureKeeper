@@ -37,7 +37,7 @@ pressurekeeper/
   clock.py           Clock protocol (MonotonicClock for real use, FakeClock for tests/sim time)
   interfaces.py       RubyPressureSource / MembranePressureController protocols
   estimator.py         PressureEstimator: outlier-suppressed filtering, slope, validity
-  gain.py               GainEstimator: online, pressure-binned sensitivity estimation
+  gain.py               GainEstimator: run-local adaptive or legacy-binned sensitivity estimation
   safety.py              SafetySupervisor: the only thing allowed to veto pressurization
   controller.py           OneSidedPressureController: the state machine
   logging_sink.py          DataLogger: CSV time series (ticks / commands / steps / events)
@@ -107,27 +107,43 @@ the slope threshold is tightened and the wait is extended
 If it doesn't, "no response has arrived yet" (flat because the dead-time
 delay hasn't elapsed) is indistinguishable from "settled" under a pure
 slope-threshold criterion, and the controller can stack multiple oversized
-commands before any of them has shown its real effect. `config/default.yaml`
-uses 8-25 s specifically to stay well clear of any plausible dead time;
-don't shrink these without characterizing your actual system's dead time
-first.
+commands before any of them has shown its real effect. Adaptive-local mode
+uses `gain_estimation.adaptive_minimum_settle_time_s`; legacy-region mode
+uses each region's `minimum_settle_time_s`. Do not shrink either without
+characterizing the complete acquisition/plant dead time first.
 
 ### Step sizing
 
+The default `adaptive_local` mode identifies the current loading rather than
+using a cell calibrated in advance. With no trustworthy local slope it sends
+a small, slow gas-pressure probe directly. Even that probe is capped by
+`requested_sample_step / adaptive_probe_max_expected_gain`, tying an
+unknown-gain command to the remaining target headroom. A settled response
+that is not statistically distinguishable from ruby noise is treated as
+"not detected" (never as zero gain), allowing only the *next* probe to grow
+by a bounded factor. Growth additionally requires the gas ramp to finish and
+`adaptive_no_response_wait_s` to elapse, separately from ordinary settling.
+The first significant settled response immediately supplies
+`dP_sample/dP_gas(actual)`.
+
+Thereafter, step sizing uses only settled observations close to the current
+sample pressure:
+
 ```
-control_target = user_target - approach_margin
-predicted_error = control_target - predicted_pressure
-requested_sample_step = min(approach_factor * predicted_error, max_sample_step_for_region)
-safe_gain = GainEstimator.estimate(...)   # conservative, pressure-binned, online
-membrane_step = clamp(requested_sample_step / safe_gain, 0, region.max_membrane_step)
+requested_sample_step = min(approach_factor * predicted_error,
+                            adaptive_max_sample_step)
+safe_forward_gain = local_gain + uncertainty + positive_curvature_allowance
+membrane_step = requested_sample_step / safe_forward_gain
 ```
 
-`safe_gain` starts from a conservative, per-region prior
-(`GainRegion.safe_gain`, from config) and switches to an online estimate
-(median + `safety_factor * spread`, floored at the configured upper
-percentile of observed gains) once enough settled steps have been observed
-near the current pressure — always biased toward the safe (larger) side,
-never the average.
+The curvature allowance extrapolates an observed upward gain trend only over
+the proposed next sample step. Distant low-pressure observations are not
+pooled into a high-pressure estimate. Per-step growth, absolute gas-step size,
+and near-target sample steps remain independently capped.
+
+`legacy_regions` remains available for old configurations. In that mode the
+original pressure-binned `GainRegion.safe_gain` schedule and online binned
+estimator are unchanged.
 
 ### States
 
@@ -181,8 +197,8 @@ tracked through the end of its PAUSE episode and written to
 `interrupted_steps.csv`. Its peak sample-pressure slope divided by the
 commanded membrane slew supplies a conservative lower bound for the separate
 rate limiter. `gain_estimation.interrupted_rate_learning_mode` controls
-whether this is disabled (`off`), audit-only (`observe`, the default), or
-applied to later commands in the same run (`enforce`). Any overlapping
+whether this is disabled (`off`), audit-only (`observe`), or applied to
+later commands in the same run (`enforce`, the default). Any overlapping
 communication, sensor, manual-pause, or abort condition disqualifies and
 removes the online observation.
 
@@ -235,7 +251,7 @@ top of an unknown real state.
 ## Configuration
 
 See `config/default.yaml` (documented inline). All device-specific numbers
-— API URLs/keys, gain schedule, safety limits, hysteresis margins — live
+— API URLs/keys, exploration bounds, safety limits, hysteresis margins — live
 there; nothing device-specific is hardcoded. Fields marked `SITE-SPECIFIC`
 must be reviewed before use, in particular:
 
@@ -246,7 +262,15 @@ must be reviewed before use, in particular:
 - `safety.max_sample_pressure_gpa` (your experiment's planned ceiling)
 - `safety.minimum_source_pressure_headroom_mpa` (strict minimum is zero,
   meaning supply must still be greater than setpoint)
-- `gain_regions` (calibrate the gain schedule against your actual cell)
+- `gain_estimation.initial_probe_step_mpa`, `probe_rate_mpa_per_min`, and
+  adaptive step ceilings (safe exploration bounds for the apparatus)
+- `gain_estimation.adaptive_probe_max_expected_gain` (the high-side physical
+  envelope that bounds unknown-gain probes by target headroom)
+- `gain_estimation.adaptive_no_response_wait_s` (post-ramp dead-time
+  observation before an undetected response may grow the probe)
+
+`gain_regions` remains present for configuration compatibility and is used
+only by `legacy_regions`; adaptive-local sizing does not use its gain values.
 
 The default independent sample compression-rate ceiling is
 `0.5 GPa/min`. It can be changed at runtime from the GUI or cleared
@@ -354,7 +378,8 @@ full closed loop against the simulator (nonlinear gain, lag, dead time,
 creep, noise, outliers, irreversibility) for every scenario in the spec:
 low- and high-pressure convergence, gain surge, outliers, a ruby API outage,
 a slow PACE5000/sample response, creep near target, an underestimated-gain
-surprise, approaching the hard limit (including a forced overshoot past it),
+surprise, adaptive-local convergence with deliberately unusable legacy gain
+priors, approaching the hard limit (including a forced overshoot past it),
 a small dip during HOLD, a manual stop mid-run, and — going beyond "no new
 commands are issued" to actually confirm the membrane's *actual* pressure
 stops climbing — ABORT/PAUSE/HOLD mid-ramp and a target lowered mid-ramp.

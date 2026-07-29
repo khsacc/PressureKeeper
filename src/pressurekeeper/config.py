@@ -158,11 +158,52 @@ class ApproachConfig(BaseModel):
 
 
 class GainEstimationConfig(BaseModel):
+    # ``legacy_regions`` retains the original pressure-binned gain schedule.
+    # ``adaptive_local`` identifies dP_sample/dP_membrane from the current
+    # loading itself and uses direct gas-pressure probes until a local slope is
+    # available.  The model default stays legacy for backwards-compatible
+    # programmatic construction; config/default.yaml opts into adaptive_local.
+    step_sizing_mode: Literal["legacy_regions", "adaptive_local"] = "legacy_regions"
     bin_width_gpa: float = Field(default=0.5, gt=0, allow_inf_nan=False)
     min_samples_for_estimate: int = Field(default=3, ge=1)
     safety_factor: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     upper_percentile: float = Field(default=90.0, gt=50.0, lt=100.0)
     neighbor_bins: int = Field(default=1, ge=0)
+    # Adaptive-local static-gain estimation and probing.  These are
+    # experiment-independent exploration bounds, not a calibrated DAC gain
+    # curve. A no-response step is allowed to grow only after it has genuinely
+    # settled and never by more than probe_growth_factor.
+    local_pressure_window_gpa: float = Field(default=0.25, gt=0, allow_inf_nan=False)
+    local_max_observations: int = Field(default=5, ge=1)
+    local_gain_safety_factor: float = Field(default=1.25, ge=1.0, allow_inf_nan=False)
+    local_uncertainty_safety_factor: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    local_curvature_safety_factor: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    response_detection_sigma: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    response_detection_floor_gpa: float = Field(default=0.002, gt=0, allow_inf_nan=False)
+    initial_probe_step_mpa: float = Field(default=0.02, gt=0, allow_inf_nan=False)
+    probe_growth_factor: float = Field(default=1.6, gt=1.0, allow_inf_nan=False)
+    max_probe_step_mpa: float = Field(default=0.20, gt=0, allow_inf_nan=False)
+    # Global high-side physical envelope used only while the local static gain
+    # is unknown. It ties every probe to the remaining sample-pressure budget:
+    # probe <= requested_sample_step / this value.
+    adaptive_probe_max_expected_gain: float = Field(
+        default=5.0, gt=0, allow_inf_nan=False
+    )
+    # Extra observation time after the gas ramp has completed before a
+    # statistically flat response may be classified as "not detected" and
+    # permit the next probe to grow.
+    adaptive_no_response_wait_s: float = Field(
+        default=30.0, gt=0, allow_inf_nan=False
+    )
+    max_step_growth_factor: float = Field(default=1.5, ge=1.0, allow_inf_nan=False)
+    rate_exceeded_step_backoff_factor: float = Field(default=0.5, gt=0, le=1.0)
+    probe_rate_mpa_per_min: float = Field(default=0.5, gt=0, allow_inf_nan=False)
+    adaptive_max_sample_step_gpa: float = Field(default=0.03, gt=0, allow_inf_nan=False)
+    adaptive_max_membrane_step_mpa: float = Field(default=0.25, gt=0, allow_inf_nan=False)
+    adaptive_minimum_settle_time_s: float = Field(default=12.0, ge=0, allow_inf_nan=False)
+    adaptive_settled_slope_threshold_gpa_s: float = Field(
+        default=0.002, gt=0, allow_inf_nan=False
+    )
     # Interrupted steps are never mixed into the settled/static-gain data.
     # They can, however, provide a conservative lower bound for the separate
     # dynamic slew-rate limiter. ``observe`` computes/logs that bound without
@@ -253,6 +294,30 @@ class Configuration(BaseModel):
                 f"safety.max_membrane_step_mpa_hard ({self.safety.max_membrane_step_mpa_hard}) "
                 f"must be >= every gain_regions[].max_membrane_step, otherwise those steps are "
                 f"unconditionally rejected and the controller can never progress: {bad}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _adaptive_steps_within_hard_cap(self) -> "Configuration":
+        gain = self.gain_estimation
+        if gain.step_sizing_mode != "adaptive_local":
+            return self
+        if gain.initial_probe_step_mpa > gain.max_probe_step_mpa:
+            raise ValueError(
+                "gain_estimation.initial_probe_step_mpa must be <= max_probe_step_mpa"
+            )
+        if gain.max_probe_step_mpa > gain.adaptive_max_membrane_step_mpa:
+            raise ValueError(
+                "gain_estimation.max_probe_step_mpa must be <= "
+                "adaptive_max_membrane_step_mpa"
+            )
+        if (
+            gain.adaptive_max_membrane_step_mpa
+            > self.safety.max_membrane_step_mpa_hard
+        ):
+            raise ValueError(
+                "gain_estimation.adaptive_max_membrane_step_mpa must be <= "
+                "safety.max_membrane_step_mpa_hard"
             )
         return self
 

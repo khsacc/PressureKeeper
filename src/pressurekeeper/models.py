@@ -151,11 +151,18 @@ class StepRecord:
     sample_pressure_before: float
     reason: str
     decision: dict[str, Any] = field(default_factory=dict)
+    # Static local gain should be derived from what the gas pressure actually
+    # did, not merely from the requested setpoint.  The legacy command values
+    # above remain for audit/backwards compatibility.
+    membrane_actual_before: float | None = None
 
     t_settled: float | None = None
     sample_pressure_after: float | None = None
+    membrane_actual_after: float | None = None
     max_slope_gpa_s: float = 0.0
     measurement_std_gpa: float | None = None
+    response_detection_threshold_gpa: float | None = None
+    response_detected: bool | None = None
     settled: bool = False
     # True if the command that opened this step raised a MembraneCommError
     # (response lost/timed out) -- the write may or may not have actually
@@ -174,9 +181,19 @@ class StepRecord:
 
     @property
     def observed_gain(self) -> float | None:
-        if self.sample_pressure_after is None or not self.settled:
+        if (
+            self.sample_pressure_after is None
+            or not self.settled
+            or self.response_detected is False
+        ):
             return None
-        d_membrane = self.membrane_pressure_after - self.membrane_pressure_before
+        if (
+            self.membrane_actual_before is not None
+            and self.membrane_actual_after is not None
+        ):
+            d_membrane = self.membrane_actual_after - self.membrane_actual_before
+        else:
+            d_membrane = self.membrane_pressure_after - self.membrane_pressure_before
         if d_membrane <= 0:
             return None
         return (self.sample_pressure_after - self.sample_pressure_before) / d_membrane
@@ -237,12 +254,13 @@ class GainEstimate:
     safe_gain: float
     estimated_gain: float
     gain_uncertainty: float
-    source: Literal["prior", "observed"]
+    source: Literal["prior", "observed", "probe"]
     n_samples: int
     rate_limit_gain: float
-    rate_gain_source: Literal["configured", "settled", "interrupted"] = "configured"
+    rate_gain_source: Literal["none", "configured", "settled", "interrupted"] = "configured"
     interrupted_rate_observation_count: int = 0
     learned_rate_floor: float = 0.0
+    local_gain_trend_per_gpa: float = 0.0
 
 
 @dataclass(frozen=True)

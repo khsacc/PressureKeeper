@@ -4,6 +4,8 @@ required-by-spec scenario list.
 """
 from __future__ import annotations
 
+from dataclasses import replace as dataclass_replace
+
 from pressurekeeper.models import ControlState
 from pressurekeeper.sim import DACPhysicsConfig
 
@@ -107,6 +109,9 @@ def test_pace5000_slow_response_does_not_trigger_premature_commands(tmp_path):
     ctx, clock = build_sim_app(tmp_path, dry_run=False, physics=physics, seed=5)
     ctx.controller.set_target(0.6)
     ctx.controller.set_max_compression_rate(None)
+    # The simulator now honours the rate sent with each PACE5000 command;
+    # retain this scenario's intended fast-membrane/slow-sample separation.
+    ctx.controller.set_membrane_rate_mpa_per_min(60.0)
 
     run_until(ctx, clock, DT, max_ticks=40_000, predicate=lambda s: len(ctx.membrane.commands) >= 2)
     ctx.close()
@@ -168,6 +173,73 @@ def test_actual_response_larger_than_estimated_gain_adapts_and_stays_bounded(tmp
     estimate = ctx.controller.gain_estimator.estimate(snap.filtered_pressure_gpa, region)
     assert estimate.source == "observed"
     assert estimate.estimated_gain > region.safe_gain
+
+
+def test_adaptive_local_tracks_one_loading_without_region_calibration(tmp_path):
+    physics = DACPhysicsConfig(
+        seed=17,
+        base_gain_gpa_per_mpa=0.25,
+        gain_pressure_coeff=0.40,
+        measurement_noise_std_gpa=0.001,
+    )
+    ctx, clock = build_sim_app(
+        tmp_path,
+        dry_run=False,
+        max_sample_pressure_gpa=3.0,
+        physics=physics,
+        seed=17,
+    )
+    # Deliberately nonsensical legacy priors: adaptive-local must neither use
+    # them as a floor nor require repeated observations inside fixed bins.
+    adaptive = ctx.controller.config.model_copy(update={
+        "gain_regions": [
+            dataclass_replace(region, safe_gain=50.0, rate_limit_gain=None)
+            for region in ctx.controller.config.gain_regions
+        ],
+        "gain_estimation": ctx.controller.config.gain_estimation.model_copy(update={
+            "step_sizing_mode": "adaptive_local",
+            "initial_probe_step_mpa": 0.03,
+            "probe_growth_factor": 1.6,
+            "max_probe_step_mpa": 0.12,
+            "adaptive_probe_max_expected_gain": 2.0,
+            "adaptive_no_response_wait_s": 3.0,
+            "adaptive_max_membrane_step_mpa": 0.15,
+            "adaptive_max_sample_step_gpa": 0.03,
+            "probe_rate_mpa_per_min": 2.0,
+            "adaptive_minimum_settle_time_s": 3.0,
+            "adaptive_settled_slope_threshold_gpa_s": 0.008,
+            "response_detection_floor_gpa": 0.002,
+            "local_gain_safety_factor": 1.35,
+            "local_pressure_window_gpa": 0.30,
+            "interrupted_rate_learning_mode": "enforce",
+        }),
+    })
+    ctx.controller.apply_config_update(adaptive)
+    ctx.controller.set_target(1.2)
+
+    snap, ticks, max_p = run_until(
+        ctx,
+        clock,
+        DT,
+        max_ticks=60_000,
+        predicate=lambda s: s.state == ControlState.HOLD,
+    )
+    ctx.close()
+
+    assert snap.state == ControlState.HOLD, f"adaptive run did not converge in {ticks} ticks"
+    assert max_p <= 1.2 + 0.05 + 0.01
+    region = ctx.controller.config.region_for(snap.filtered_pressure_gpa)
+    estimate = ctx.controller.gain_estimator.estimate(
+        snap.filtered_pressure_gpa,
+        region,
+    )
+    assert estimate.source == "observed"
+    assert estimate.safe_gain < 50.0
+    assert any(command[2] <= 2.0 for command in ctx.membrane.commands)
+    assert (
+        ctx.dac.cfg.membrane_ramp_rate_mpa_per_min
+        == ctx.membrane.commands[-1][2]
+    ), "simulator physics must apply the slew rate sent with the latest command"
 
 
 def test_approaching_hard_sample_pressure_limit_is_respected(tmp_path):

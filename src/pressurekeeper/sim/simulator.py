@@ -186,6 +186,10 @@ class SimulatedMembraneController(_OutageMixin):
         self._dac.advance_to(now)
         self._setpoint_mpa = min(pressure_mpa, self._dac.cfg.max_membrane_pressure_mpa)
         self._dac.membrane_setpoint_mpa = self._setpoint_mpa
+        # The real PACE5000 applies the rate sent with each setpoint. Keeping
+        # the simulator pinned to its construction-time rate made learned slew
+        # limits observable in command logs but physically ineffective.
+        self._dac.cfg.membrane_ramp_rate_mpa_per_min = rate_mpa_per_min
         self.commands.append((now, pressure_mpa, rate_mpa_per_min))
 
     def set_control_mode(self, enabled: bool) -> None:

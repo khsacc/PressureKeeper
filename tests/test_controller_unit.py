@@ -9,7 +9,7 @@ import csv
 from dataclasses import replace as dataclass_replace
 
 from pressurekeeper.errors import MembraneCommError
-from pressurekeeper.models import ControlState
+from pressurekeeper.models import ControlState, StepRecord
 
 from .helpers import build_scripted_controller as build
 from .helpers import build_sim_app, make_config, run_until, tick
@@ -595,6 +595,223 @@ def test_clean_rate_pause_learns_threshold_tick_and_slows_next_command(tmp_path)
     step_rows = [row for row in rows if int(row["step_id"]) == first_step_id]
     assert [row["phase"] for row in step_rows] == ["started", "final"]
     assert all(row["eligible_for_rate_learning"] == "True" for row in step_rows)
+
+
+def test_adaptive_no_response_probes_grow_only_after_settle(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    adaptive_config = controller.config.model_copy(update={
+        "gain_estimation": controller.config.gain_estimation.model_copy(update={
+            "step_sizing_mode": "adaptive_local",
+            "initial_probe_step_mpa": 0.01,
+            "probe_growth_factor": 2.0,
+            "max_probe_step_mpa": 0.04,
+            "adaptive_max_membrane_step_mpa": 0.04,
+            "adaptive_probe_max_expected_gain": 0.1,
+            "adaptive_no_response_wait_s": 0.5,
+            "probe_rate_mpa_per_min": 24.0,
+            "adaptive_minimum_settle_time_s": 0.5,
+            "adaptive_settled_slope_threshold_gpa_s": 0.05,
+            "response_detection_floor_gpa": 0.005,
+        }),
+    })
+    controller.apply_config_update(adaptive_config)
+    controller.set_max_compression_rate(None)
+
+    ruby.push(0.10, n=160)
+    tick(controller, clock, n=160)
+    logger.close()
+
+    advancing_setpoints: list[float] = []
+    high_water = 0.0
+    for _, setpoint in membrane.commands:
+        if setpoint > high_water + 1e-9:
+            advancing_setpoints.append(setpoint)
+            high_water = setpoint
+    assert len(advancing_setpoints) >= 3
+    deltas = [
+        advancing_setpoints[0],
+        *[
+            after - before
+            for before, after in zip(
+                advancing_setpoints,
+                advancing_setpoints[1:],
+            )
+        ],
+    ]
+    assert abs(deltas[0] - 0.01) < 1e-9
+    assert abs(deltas[1] - 0.02) < 1e-9
+    assert abs(deltas[2] - 0.04) < 1e-9
+    assert max(deltas) <= 0.04 + 1e-9
+
+
+def test_adaptive_unknown_gain_probe_is_capped_by_target_headroom(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=0.29)
+    adaptive_config = controller.config.model_copy(update={
+        "gain_estimation": controller.config.gain_estimation.model_copy(update={
+            "step_sizing_mode": "adaptive_local",
+            # Deliberately make the ladder itself dangerously large. The
+            # target-derived sample budget must be the active bound.
+            "initial_probe_step_mpa": 0.20,
+            "max_probe_step_mpa": 0.20,
+            "adaptive_max_membrane_step_mpa": 0.20,
+            "adaptive_probe_max_expected_gain": 5.0,
+            "probe_rate_mpa_per_min": 24.0,
+        }),
+    })
+    controller.apply_config_update(adaptive_config)
+    controller.set_max_compression_rate(None)
+
+    ruby.push(0.10, n=30)
+    tick(controller, clock, n=30)
+    logger.close()
+
+    assert membrane.commands
+    first_setpoint = membrane.commands[0][1]
+    # target-current=0.19 GPa puts this inside near_target_distance; the
+    # 0.015 GPa near-target sample budget / 5 GPa/MPa envelope = 0.003 MPa.
+    assert first_setpoint <= 0.003 + 1e-9
+    assert controller._last_command_decision is not None
+    assert (
+        controller._last_command_decision["probe_target_cap_mpa"]
+        <= 0.003 + 1e-9
+    )
+
+
+def test_adaptive_no_response_wait_blocks_dead_time_probe_stacking(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    adaptive_config = controller.config.model_copy(update={
+        "gain_estimation": controller.config.gain_estimation.model_copy(update={
+            "step_sizing_mode": "adaptive_local",
+            "initial_probe_step_mpa": 0.01,
+            "probe_growth_factor": 2.0,
+            "max_probe_step_mpa": 0.04,
+            "adaptive_max_membrane_step_mpa": 0.04,
+            "adaptive_probe_max_expected_gain": 0.1,
+            "adaptive_no_response_wait_s": 5.0,
+            "probe_rate_mpa_per_min": 24.0,
+            "adaptive_minimum_settle_time_s": 0.5,
+            "adaptive_settled_slope_threshold_gpa_s": 0.05,
+            "response_detection_floor_gpa": 0.005,
+        }),
+    })
+    controller.apply_config_update(adaptive_config)
+    controller.set_max_compression_rate(None)
+
+    ruby.push(0.10, n=80)
+    while not membrane.commands:
+        tick(controller, clock)
+    first_command_t = membrane.commands[0][0]
+    # Less than ramp_time_margin_s (1 s) + no-response wait (5 s).
+    tick(controller, clock, n=20)  # 5 s
+    assert len(membrane.commands) == 1
+
+    for _ in range(40):
+        tick(controller, clock)
+        if len(membrane.commands) >= 2:
+            break
+    logger.close()
+
+    assert len(membrane.commands) >= 2
+    assert membrane.commands[1][0] - first_command_t >= 6.0 - 1e-9
+
+
+def test_adaptive_minimum_meaningful_step_does_not_override_growth_cap(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    adaptive_config = controller.config.model_copy(update={
+        "approach": controller.config.approach.model_copy(update={
+            "min_membrane_step_mpa": 0.01,
+        }),
+        "gain_estimation": controller.config.gain_estimation.model_copy(update={
+            "step_sizing_mode": "adaptive_local",
+            "max_step_growth_factor": 1.0,
+        }),
+    })
+    controller.apply_config_update(adaptive_config)
+    controller.set_max_compression_rate(None)
+    controller._adaptive_last_membrane_step_mpa = 0.001
+
+    observation = StepRecord(
+        step_id=999,
+        t_command=0.0,
+        membrane_pressure_before=0.0,
+        membrane_pressure_after=0.001,
+        membrane_actual_before=0.0,
+        membrane_actual_after=0.001,
+        sample_pressure_before=0.10,
+        sample_pressure_after=0.20,
+        response_detected=True,
+        settled=True,
+        reason="seed high local gain",
+    )
+    controller.gain_estimator.record_step(observation)
+
+    ruby.push(0.10, n=30)
+    tick(controller, clock, n=30)
+    logger.close()
+
+    assert membrane.commands == [], \
+        "min_membrane_step must not enlarge a step beyond max_step_growth_factor"
+
+
+def test_adaptive_rate_pause_forces_smaller_probe_on_resume(tmp_path):
+    controller, ruby, membrane, clock, logger = build(tmp_path, target=1.0)
+    adaptive_config = controller.config.model_copy(update={
+        "gain_estimation": controller.config.gain_estimation.model_copy(update={
+            "step_sizing_mode": "adaptive_local",
+            "initial_probe_step_mpa": 0.02,
+            "max_probe_step_mpa": 0.08,
+            "adaptive_max_membrane_step_mpa": 0.08,
+            "adaptive_probe_max_expected_gain": 1.0,
+            "adaptive_no_response_wait_s": 0.5,
+            "probe_rate_mpa_per_min": 24.0,
+            "adaptive_minimum_settle_time_s": 1.0,
+            "adaptive_settled_slope_threshold_gpa_s": 0.02,
+            "interrupted_rate_learning_mode": "enforce",
+        }),
+    })
+    controller.apply_config_update(adaptive_config)
+    controller.set_max_compression_rate(0.5)
+
+    for _ in range(40):
+        ruby.push(0.10)
+        tick(controller, clock)
+        if controller._pending_step is not None:
+            break
+    assert controller._pending_step is not None
+    pressure = 0.10
+    for _ in range(30):
+        pressure += 0.003
+        ruby.push(pressure)
+        snap = tick(controller, clock)
+        if snap.state == ControlState.PAUSE:
+            break
+    assert snap.state == ControlState.PAUSE
+    assert controller._adaptive_force_probe
+    interrupted_step_id = controller._interrupted_step_observation.step_id
+    expected_backoff = (
+        controller._interrupted_step_observation.membrane_pressure_after
+        - controller._interrupted_step_observation.membrane_pressure_before
+    ) * 0.5
+    assert (
+        controller._adaptive_next_probe_step_mpa
+        <= expected_backoff + 1e-9
+    )
+
+    for _ in range(160):
+        ruby.push(pressure)
+        tick(controller, clock)
+        if controller._next_step_id > interrupted_step_id + 1:
+            break
+    logger.close()
+
+    assert controller._next_step_id > interrupted_step_id + 1
+    assert controller._last_command_decision is not None
+    assert controller._last_command_decision["step_sizing_mode"] == "adaptive_local"
+    assert controller._last_command_decision["adaptive_probe"] is True
+    assert (
+        controller._last_command_decision["membrane_step_mpa"]
+        <= expected_backoff + 1e-9
+    )
 
 
 def test_manual_pause_disqualifies_an_in_progress_rate_observation(tmp_path):

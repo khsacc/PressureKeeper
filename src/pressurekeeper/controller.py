@@ -74,11 +74,17 @@ class OneSidedPressureController:
 
         self._membrane_status: MembraneStatus | None = None
         self._membrane_status_fresh_this_tick = False
+        self._ruby_read_succeeded_this_tick = False
         self._last_membrane_poll_t: float | None = None
         self._pending_step: StepRecord | None = None
         self._staged_rearm_step: StepRecord | None = None
         self._interrupted_step_observation: InterruptedStepObservation | None = None
         self._next_step_id = 1
+        self._adaptive_next_probe_step_mpa = (
+            config.gain_estimation.initial_probe_step_mpa
+        )
+        self._adaptive_last_membrane_step_mpa: float | None = None
+        self._adaptive_force_probe = False
         self._settled_since: float | None = None
         self._prior_state_before_pause: ControlState | None = None
         # Compression-rate-only PAUSE recovery (see _try_hold_at_current_pressure):
@@ -173,6 +179,11 @@ class OneSidedPressureController:
             self._estimator.update_config(config.estimator)
             self._gain_estimator.update_config(config.gain_estimation)
             self._safety.update_config(config.safety, self._clock.now())
+            self._adaptive_next_probe_step_mpa = (
+                config.gain_estimation.initial_probe_step_mpa
+            )
+            self._adaptive_last_membrane_step_mpa = None
+            self._adaptive_force_probe = False
             # SafetySupervisor.update_config() resets membrane_stop_intended
             # to its own construction default (False) -- restore the
             # startup invariant that nothing re-arms Control until a fresh
@@ -444,6 +455,7 @@ class OneSidedPressureController:
 
         with self._lock:
             self._membrane_status_fresh_this_tick = False
+            self._ruby_read_succeeded_this_tick = ruby_error is None
             prior_filtered = self._estimator.filtered_pressure()
             extra_events: list[SafetyEvent] = []
 
@@ -794,6 +806,12 @@ class OneSidedPressureController:
                                      "while the compression-rate pause continues"))
 
     def _advance(self, now: float) -> None:
+        # A short communication-error grace exists before PAUSE so one
+        # transient timeout does not flap Control. It must not, however, allow
+        # a fresh pressure command to be calculated from the previous ruby
+        # sample on the failed tick.
+        if not self._ruby_read_succeeded_this_tick:
+            return
         if not self._estimator.is_valid(now):
             return
         filtered = self._estimator.filtered_pressure()
@@ -889,9 +907,14 @@ class OneSidedPressureController:
         step = self._pending_step
         assert step is not None
 
-        region = self._cfg.region_for(filtered)
-        threshold = region.settled_slope_threshold_gpa_s
-        min_settle = region.minimum_settle_time_s
+        gain_cfg = self._cfg.gain_estimation
+        if gain_cfg.step_sizing_mode == "adaptive_local":
+            threshold = gain_cfg.adaptive_settled_slope_threshold_gpa_s
+            min_settle = gain_cfg.adaptive_minimum_settle_time_s
+        else:
+            region = self._cfg.region_for(filtered)
+            threshold = region.settled_slope_threshold_gpa_s
+            min_settle = region.minimum_settle_time_s
         near_target = (self.user_target_gpa - filtered) < self._cfg.approach.near_target_distance_gpa
         if near_target:
             threshold *= self._cfg.approach.near_target_slope_threshold_scale
@@ -920,6 +943,28 @@ class OneSidedPressureController:
         if commanded_rate and commanded_rate > 0 and membrane_step_mpa > 0:
             ramp_time_s = membrane_step_mpa / (commanded_rate / 60.0) + self._cfg.approach.ramp_time_margin_s
         blackout_elapsed = (now - response_start_t) >= max(min_settle, ramp_time_s)
+        adaptive_current_sample: float | None = None
+        adaptive_detection_threshold: float | None = None
+        no_response_observation_elapsed = True
+        if gain_cfg.step_sizing_mode == "adaptive_local":
+            adaptive_current_sample = self._conservative_sample_pressure(filtered)
+            measurement_std = self._estimator.measurement_std()
+            adaptive_detection_threshold = max(
+                gain_cfg.response_detection_floor_gpa,
+                gain_cfg.response_detection_sigma * (measurement_std or 0.0),
+            )
+            response_detected_so_far = (
+                adaptive_current_sample - step.sample_pressure_before
+                > adaptive_detection_threshold
+            )
+            if not response_detected_so_far:
+                # A flat trace may only grow the probe after the commanded gas
+                # ramp plus a separate dead-time observation window. This is
+                # intentionally stricter than the ordinary settle blackout.
+                no_response_observation_elapsed = (
+                    now - response_start_t
+                    >= ramp_time_s + gain_cfg.adaptive_no_response_wait_s
+                )
 
         # A flat slope only means "settled" if the membrane has actually
         # finished ramping to the commanded setpoint — otherwise it can just
@@ -934,16 +979,81 @@ class OneSidedPressureController:
             >= step.membrane_pressure_after - self._cfg.approach.membrane_arrival_tolerance_mpa
         )
 
-        if settle_confirmed and blackout_elapsed and membrane_arrived:
+        if (
+            settle_confirmed
+            and blackout_elapsed
+            and membrane_arrived
+            and no_response_observation_elapsed
+        ):
             step.settled = True
             step.t_settled = now
-            step.sample_pressure_after = filtered
+            step.sample_pressure_after = (
+                adaptive_current_sample
+                if gain_cfg.step_sizing_mode == "adaptive_local"
+                else filtered
+            )
+            step.membrane_actual_after = (
+                self._membrane_status.pressure_mpa
+                if self._membrane_status is not None
+                else None
+            )
             step.measurement_std_gpa = self._estimator.measurement_std()
+            if gain_cfg.step_sizing_mode == "adaptive_local":
+                assert adaptive_detection_threshold is not None
+                step.response_detection_threshold_gpa = (
+                    adaptive_detection_threshold
+                )
+                step.response_detected = (
+                    step.sample_pressure_after - step.sample_pressure_before
+                    > adaptive_detection_threshold
+                )
             self._gain_estimator.record_step(step)
+            self._update_adaptive_probe_after_settle(step)
             if self._logger is not None:
                 self._safe_call(lambda: self._logger.log_step_record(step))
             self._pending_step = None
             self._settled_since = None
+
+    def _update_adaptive_probe_after_settle(self, step: StepRecord) -> None:
+        """Advance/reset the run-local probe only after a genuine settle.
+
+        A statistically insignificant response is censored rather than
+        recorded as zero gain. It permits a bounded geometric increase on the
+        next probe; any detected response immediately returns the probe to its
+        conservative initial size and releases a rate-pause backoff.
+        """
+        gain_cfg = self._cfg.gain_estimation
+        if (
+            gain_cfg.step_sizing_mode != "adaptive_local"
+            or step.decision.get("step_sizing_mode") != "adaptive_local"
+        ):
+            return
+        if step.response_detected:
+            self._adaptive_next_probe_step_mpa = (
+                gain_cfg.initial_probe_step_mpa
+            )
+            self._adaptive_force_probe = False
+            return
+
+        if (
+            step.membrane_actual_before is not None
+            and step.membrane_actual_after is not None
+        ):
+            gas_delta = (
+                step.membrane_actual_after - step.membrane_actual_before
+            )
+        else:
+            gas_delta = (
+                step.membrane_pressure_after - step.membrane_pressure_before
+            )
+        if gas_delta > 0:
+            self._adaptive_next_probe_step_mpa = min(
+                max(
+                    gain_cfg.initial_probe_step_mpa,
+                    gas_delta * gain_cfg.probe_growth_factor,
+                ),
+                gain_cfg.max_probe_step_mpa,
+            )
 
     def _maybe_issue_step(
         self,
@@ -967,24 +1077,30 @@ class OneSidedPressureController:
         # step smaller (or suppress it), but must never be ignored in favour of
         # a lower filtered value: doing so can select a lower-gain region and
         # size a command that crosses into the accelerating part of the plant.
-        region = self._cfg.region_for(sizing_pressure)
-        gain_est = self._gain_estimator.estimate(sizing_pressure, region)
-
         approach = self._cfg.approach
+        gain_cfg = self._cfg.gain_estimation
+        adaptive = gain_cfg.step_sizing_mode == "adaptive_local"
+        region = self._cfg.region_for(sizing_pressure)
         control_target = target_gpa - approach.approach_margin_gpa
         predicted_error = control_target - predicted
         if predicted_error <= 0:
             return
 
-        max_sample_step = region.max_sample_step_gpa
+        max_sample_step = (
+            gain_cfg.adaptive_max_sample_step_gpa
+            if adaptive
+            else region.max_sample_step_gpa
+        )
         if (target_gpa - predicted) < approach.near_target_distance_gpa:
             max_sample_step = min(max_sample_step, approach.near_target_max_sample_step_gpa)
-        # Never let a step's implied sample-pressure rise cross into a
-        # higher-gain region than the one `gain_est` was just computed for --
-        # otherwise part of the step would be sized using a lower gain than
-        # actually applies once the sample pressure crosses the boundary.
-        max_sample_step = min(max_sample_step, max(0.0, region.sample_pressure_max_gpa - sizing_pressure))
-        if self._max_compression_rate_gpa_per_min is not None:
+        if not adaptive:
+            # Legacy scheduling must not cross into a higher-gain region using
+            # the lower region's estimate.
+            max_sample_step = min(
+                max_sample_step,
+                max(0.0, region.sample_pressure_max_gpa - sizing_pressure),
+            )
+        if not adaptive and self._max_compression_rate_gpa_per_min is not None:
             # A step is expected to take roughly region.minimum_settle_time_s
             # to show its full response (see the settle-detection blackout in
             # _update_pending_step), so bounding requested_sample_step by
@@ -997,11 +1113,46 @@ class OneSidedPressureController:
         if requested_sample_step <= 0.0:
             return
 
+        gain_est = self._gain_estimator.estimate(
+            sizing_pressure,
+            region,
+            forward_sample_step_gpa=requested_sample_step,
+        )
         safe_gain = gain_est.safe_gain
-        if safe_gain <= 0:
-            return
-
-        membrane_step = max(0.0, min(requested_sample_step / safe_gain, region.max_membrane_step))
+        adaptive_probe = adaptive and (
+            gain_est.source == "probe" or self._adaptive_force_probe
+        )
+        probe_target_cap_mpa: float | None = None
+        if adaptive_probe:
+            probe_target_cap_mpa = (
+                requested_sample_step
+                / gain_cfg.adaptive_probe_max_expected_gain
+            )
+            membrane_step = min(
+                self._adaptive_next_probe_step_mpa,
+                gain_cfg.max_probe_step_mpa,
+                gain_cfg.adaptive_max_membrane_step_mpa,
+                probe_target_cap_mpa,
+            )
+        else:
+            if safe_gain <= 0:
+                return
+            membrane_step = requested_sample_step / safe_gain
+            membrane_step = min(
+                membrane_step,
+                (
+                    gain_cfg.adaptive_max_membrane_step_mpa
+                    if adaptive
+                    else region.max_membrane_step
+                ),
+            )
+            if adaptive and self._adaptive_last_membrane_step_mpa is not None:
+                membrane_step = min(
+                    membrane_step,
+                    self._adaptive_last_membrane_step_mpa
+                    * gain_cfg.max_step_growth_factor,
+                )
+        membrane_step = max(0.0, membrane_step)
 
         # Tighten (never loosen) the gas-side slew for *this* command so the
         # resulting sample-pressure rate can't exceed max_compression_rate_
@@ -1016,7 +1167,15 @@ class OneSidedPressureController:
         # turns out to be optimistic relative to real hardware must not also
         # under-restrict the one independent, physically-grounded rate cap.
         effective_rate_mpa_per_min = self._membrane_rate_mpa_per_min
-        if self._max_compression_rate_gpa_per_min is not None:
+        if adaptive_probe:
+            effective_rate_mpa_per_min = min(
+                effective_rate_mpa_per_min,
+                gain_cfg.probe_rate_mpa_per_min,
+            )
+        if (
+            self._max_compression_rate_gpa_per_min is not None
+            and gain_est.rate_limit_gain > 0
+        ):
             rate_cap_mpa_per_min = self._max_compression_rate_gpa_per_min / gain_est.rate_limit_gain
             effective_rate_mpa_per_min = min(effective_rate_mpa_per_min, rate_cap_mpa_per_min)
 
@@ -1068,6 +1227,7 @@ class OneSidedPressureController:
             "estimated_gain": gain_est.estimated_gain,
             "gain_uncertainty": gain_est.gain_uncertainty,
             "safe_gain": safe_gain,
+            "local_gain_trend_per_gpa": gain_est.local_gain_trend_per_gpa,
             "rate_limit_gain": gain_est.rate_limit_gain,
             "rate_gain_source": gain_est.rate_gain_source,
             "interrupted_rate_observation_count": (
@@ -1077,8 +1237,20 @@ class OneSidedPressureController:
             "requested_sample_step_gpa": requested_sample_step,
             "membrane_step_mpa": membrane_step,
             "membrane_rate_mpa_per_min": effective_rate_mpa_per_min,
-            "region_min_gpa": region.sample_pressure_min_gpa,
-            "region_max_gpa": region.sample_pressure_max_gpa,
+            "step_sizing_mode": gain_cfg.step_sizing_mode,
+            "adaptive_probe": adaptive_probe,
+            "adaptive_probe_max_expected_gain": (
+                gain_cfg.adaptive_probe_max_expected_gain
+                if adaptive_probe
+                else None
+            ),
+            "probe_target_cap_mpa": probe_target_cap_mpa,
+            "region_min_gpa": (
+                None if adaptive else region.sample_pressure_min_gpa
+            ),
+            "region_max_gpa": (
+                None if adaptive else region.sample_pressure_max_gpa
+            ),
             "source_pressure_positive_mpa": source_pressure,
             "staged_in_measure": stage_for_rearm,
         }
@@ -1103,14 +1275,24 @@ class OneSidedPressureController:
                 self._safety.set_membrane_stop_intended(False)
             return
 
+        # For adaptive identification, a newly arrived upward raw reading is
+        # the conservative baseline too. Using the lower, lagging filtered
+        # value here can manufacture a large positive "response" from filter
+        # warm-up even when the sample remains perfectly flat.
+        sample_baseline = sizing_pressure if adaptive else filtered
         step = StepRecord(
             step_id=self._next_step_id,
             t_command=now,
             membrane_pressure_before=current_setpoint,
             membrane_pressure_after=new_setpoint,
-            sample_pressure_before=filtered,
+            sample_pressure_before=sample_baseline,
             reason=reason_str,
             decision=decision,
+            membrane_actual_before=(
+                self._membrane_status.pressure_mpa
+                if self._membrane_status is not None
+                else None
+            ),
         )
 
         try:
@@ -1158,6 +1340,8 @@ class OneSidedPressureController:
         self._settled_since = None
         self._last_command_reason = f"[ambiguous ack] {step.reason}" if step.ack_uncertain else step.reason
         self._last_command_decision = step.decision
+        if step.decision.get("step_sizing_mode") == "adaptive_local":
+            self._adaptive_last_membrane_step_mpa = membrane_step_mpa
         if self._logger is not None:
             self._safe_call(lambda: self._logger.log_command(step))
         if staged_for_rearm:
@@ -1234,6 +1418,18 @@ class OneSidedPressureController:
             return
 
         step.t_drive_started = now
+        if (
+            self._cfg.gain_estimation.step_sizing_mode == "adaptive_local"
+        ):
+            filtered = self._estimator.filtered_pressure()
+            if filtered is not None:
+                # Staging can wait several status polls in Measure. Refresh
+                # the identification baseline at the actual drive boundary so
+                # pre-existing creep is not attributed to this probe.
+                step.sample_pressure_before = (
+                    self._conservative_sample_pressure(filtered)
+                )
+            step.membrane_actual_before = status.pressure_mpa
         self._staged_rearm_step = None
         self._pending_step = step
         self._settled_since = None
@@ -1359,6 +1555,41 @@ class OneSidedPressureController:
         ))
 
         for step in steps:
+            if (
+                eligible_for_rate_learning
+                and self._cfg.gain_estimation.step_sizing_mode
+                == "adaptive_local"
+            ):
+                gain_cfg = self._cfg.gain_estimation
+                status_actual = (
+                    self._membrane_status.pressure_mpa
+                    if self._membrane_status is not None
+                    else None
+                )
+                actual_before = (
+                    step.membrane_actual_before
+                    if step.membrane_actual_before is not None
+                    else step.membrane_pressure_before
+                )
+                interrupted_delta = (
+                    max(0.0, status_actual - actual_before)
+                    if status_actual is not None
+                    else max(
+                        0.0,
+                        step.membrane_pressure_after
+                        - step.membrane_pressure_before,
+                    )
+                )
+                backed_off = (
+                    interrupted_delta
+                    * gain_cfg.rate_exceeded_step_backoff_factor
+                )
+                self._adaptive_next_probe_step_mpa = max(
+                    self._cfg.approach.min_membrane_step_mpa,
+                    min(gain_cfg.initial_probe_step_mpa, backed_off),
+                )
+                self._adaptive_force_probe = True
+
             if self._interrupted_step_observation is not None:
                 self._disqualify_interrupted_rate_learning(
                     "a later interrupted step replaced this observation"
@@ -1524,7 +1755,11 @@ class OneSidedPressureController:
             estimator_valid=self._estimator.is_valid(now),
             membrane_setpoint_mpa=self._membrane_status.target_pressure_mpa if self._membrane_status else None,
             membrane_actual_mpa=self._membrane_status.pressure_mpa if self._membrane_status else None,
-            safe_gain=gain_est.safe_gain if gain_est else None,
+            safe_gain=(
+                gain_est.safe_gain
+                if gain_est is not None and gain_est.source != "probe"
+                else None
+            ),
             last_command_reason=self._last_command_reason,
             manual_pause=self._safety.is_manually_paused,
             safety_level=verdict.level,

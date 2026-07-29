@@ -2,7 +2,7 @@
 #
 # All device-specific numbers live here — nothing device-specific is
 # hardcoded in the control logic. Values marked "SITE-SPECIFIC" below are
-# placeholders and MUST be reviewed/calibrated before live use; everything
+# placeholders and MUST be reviewed before live use; everything
 # else is a reasonable conservative starting point for a He-membrane DAC
 # with a 6 MPa membrane supply.
 #
@@ -95,7 +95,9 @@ approach:
   # OneSidedPressureController._update_pending_step.
   ramp_time_margin_s: 1.0
 
-# Gain scheduling, SITE-SPECIFIC: calibrate against your cell/gasket/membrane.
+# Legacy gain scheduling. These values are ignored by the default
+# gain_estimation.step_sizing_mode=adaptive_local, but remain valid for old
+# deployments that explicitly select legacy_regions.
 # Bands must be contiguous and increasing; the last band's max is the
 # effective ceiling for gain lookups (SafetySupervisor.max_sample_pressure_gpa
 # is the real hard limit, independent of this table). A step's settle
@@ -112,7 +114,7 @@ approach:
 # safe_gain (which sizes the step itself) so a safe_gain prior that turns out
 # to be optimistic relative to real hardware can't also under-restrict the
 # rate cap -- see GainRegion.rate_limit_gain's docstring in models.py.
-# NEEDS CALIBRATION BEFORE LIVE USE: an actual real-hardware run
+# If legacy_regions is selected, this NEEDS CALIBRATION BEFORE LIVE USE: an actual real-hardware run
 # (logs/run_20260727T204500_946421/steps.csv) recorded observed_gain up to
 # ~0.59 in the 1.5-2.0 GPa band against a configured safe_gain of just 0.28
 # there -- more than 2x. Review observed_gain across steps.csv from your own
@@ -170,18 +172,47 @@ gain_regions:
     settled_slope_threshold_gpa_s: 0.001
 
 gain_estimation:
+  # The controller learns the local dP_sample/dP_gas slope from this loading.
+  # gain_regions remains below as a backwards-compatible legacy mode and is
+  # not used for step sizing while this is adaptive_local.
+  step_sizing_mode: adaptive_local
+  # The following five fields are used only by legacy_regions. Adaptive mode
+  # has separate local_* uncertainty controls below.
   bin_width_gpa: 0.5
   min_samples_for_estimate: 3
   safety_factor: 1.0
   upper_percentile: 90.0
   neighbor_bins: 1
+  local_pressure_window_gpa: 0.25
+  local_max_observations: 5
+  local_gain_safety_factor: 1.25
+  local_uncertainty_safety_factor: 1.0
+  local_curvature_safety_factor: 1.0
+  response_detection_sigma: 3.0
+  response_detection_floor_gpa: 0.002
+  initial_probe_step_mpa: 0.02
+  probe_growth_factor: 1.6
+  max_probe_step_mpa: 0.20
+  # SITE-SPECIFIC high-side physical envelope. Every unknown-gain probe is
+  # additionally capped by requested_sample_step / this value, so a restart
+  # near target cannot issue the full probe ladder step.
+  adaptive_probe_max_expected_gain: 5.0
+  # Additional post-ramp observation before "no response" may grow the probe.
+  adaptive_no_response_wait_s: 30.0
+  max_step_growth_factor: 1.5
+  rate_exceeded_step_backoff_factor: 0.5
+  probe_rate_mpa_per_min: 0.5
+  adaptive_max_sample_step_gpa: 0.03
+  adaptive_max_membrane_step_mpa: 0.25
+  adaptive_minimum_settle_time_s: 12.0
+  adaptive_settled_slope_threshold_gpa_s: 0.002
   # Interrupted steps are kept out of settled/static gain estimation. A
   # clean compression-rate-only PAUSE can still supply a conservative floor
   # for the independent slew-rate limiter:
   #   off     = do not retain an online floor
   #   observe = calculate/log the floor without changing commands
   #   enforce = apply the floor to subsequent membrane ramp rates
-  interrupted_rate_learning_mode: observe
+  interrupted_rate_learning_mode: enforce
   interrupted_rate_safety_factor: 1.25
   interrupted_rate_propagate_upward: true
 

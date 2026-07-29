@@ -1,10 +1,11 @@
-"""GainEstimator: online estimate of dP_sample/dP_membrane, binned by sample
-pressure, biased conservatively high so step sizing never under-shoots the
-true (larger, at high pressure) response.
+"""Run-local estimates of dP_sample/dP_membrane.
 
-Falls back to the configured prior (`GainRegion.safe_gain`) whenever a bin
-does not yet have enough observations — this is what makes the very first
-steps in a run, or steps into a never-before-visited pressure band, safe.
+Adaptive-local mode uses only nearby settled observations from this loading;
+without one it explicitly reports ``probe`` so the controller sends a small
+gas-side identification step. Legacy mode retains the pressure-binned,
+configured-prior estimator for backwards compatibility. Interrupted
+compression-rate responses remain a separate dynamic slew-limit signal and
+are never mixed into settled/static step sizing.
 """
 from __future__ import annotations
 
@@ -31,10 +32,14 @@ class GainEstimator:
     def __init__(self, config: GainEstimationConfig) -> None:
         self._cfg = config
         self._bins: dict[int, list[float]] = defaultdict(list)
+        # Ordered, run-local quasi-static observations. Unlike _bins these are
+        # queried only near the current pressure, so a low-pressure gain is
+        # never silently reused as the high-pressure estimate.
+        self._local_observations: list[tuple[int, float, float]] = []
         # One mutable maximum per interrupted command. A PAUSE lasts several
         # ticks; replacing its peak prevents one physical response from being
         # counted as many independent samples.
-        self._interrupted_rate_observations: dict[int, tuple[int, float]] = {}
+        self._interrupted_rate_observations: dict[int, tuple[float, float]] = {}
 
     def update_config(self, config: GainEstimationConfig) -> None:
         """Hot-swap the config and discard all recorded gain observations --
@@ -59,6 +64,7 @@ class GainEstimator:
         ):
             return
         self._bins[self._bin_index(pivot)].append(gain)
+        self._local_observations.append((step.step_id, pivot, gain))
 
     def record_interrupted_rate_observation(
         self,
@@ -80,10 +86,12 @@ class GainEstimator:
             or raw_rate_gain <= 0
         ):
             return
-        bin_index = self._bin_index(sample_pressure_gpa)
         previous = self._interrupted_rate_observations.get(observation_id)
         if previous is None or raw_rate_gain > previous[1]:
-            self._interrupted_rate_observations[observation_id] = (bin_index, raw_rate_gain)
+            self._interrupted_rate_observations[observation_id] = (
+                sample_pressure_gpa,
+                raw_rate_gain,
+            )
 
     def discard_interrupted_rate_observation(self, observation_id: int) -> None:
         """Remove an observation later contaminated by another safety cause."""
@@ -92,18 +100,32 @@ class GainEstimator:
     def _interrupted_rate_floor(self, sample_pressure_gpa: float) -> tuple[float, int]:
         if self._cfg.interrupted_rate_learning_mode == "off":
             return 0.0, 0
-        center = self._bin_index(sample_pressure_gpa)
-        relevant = [
-            raw_gain
-            for bin_index, raw_gain in self._interrupted_rate_observations.values()
-            if (
-                bin_index == center
-                or (
-                    self._cfg.interrupted_rate_propagate_upward
-                    and bin_index <= center
+        if self._cfg.step_sizing_mode == "adaptive_local":
+            relevant = [
+                raw_gain
+                for pressure, raw_gain in self._interrupted_rate_observations.values()
+                if (
+                    (
+                        self._cfg.interrupted_rate_propagate_upward
+                        and pressure <= sample_pressure_gpa
+                    )
+                    or abs(pressure - sample_pressure_gpa)
+                    <= self._cfg.local_pressure_window_gpa
                 )
-            )
-        ]
+            ]
+        else:
+            center = self._bin_index(sample_pressure_gpa)
+            relevant = [
+                raw_gain
+                for pressure, raw_gain in self._interrupted_rate_observations.values()
+                if (
+                    self._bin_index(pressure) == center
+                    or (
+                        self._cfg.interrupted_rate_propagate_upward
+                        and self._bin_index(pressure) <= center
+                    )
+                )
+            ]
         if not relevant:
             return 0.0, 0
         return max(relevant) * self._cfg.interrupted_rate_safety_factor, len(relevant)
@@ -118,7 +140,12 @@ class GainEstimator:
         settled_floor = estimate.safe_gain
         base_rate_limit = max(settled_floor, configured_floor)
         applied_rate_limit = base_rate_limit
-        rate_source: str = "settled" if settled_floor > configured_floor else "configured"
+        if settled_floor > configured_floor:
+            rate_source: str = "settled"
+        elif configured_floor > 0:
+            rate_source = "configured"
+        else:
+            rate_source = "none"
         if (
             self._cfg.interrupted_rate_learning_mode == "enforce"
             and learned_floor > applied_rate_limit
@@ -135,9 +162,85 @@ class GainEstimator:
             rate_gain_source=rate_source,
             interrupted_rate_observation_count=observation_count,
             learned_rate_floor=learned_floor,
+            local_gain_trend_per_gpa=estimate.local_gain_trend_per_gpa,
         )
 
-    def estimate(self, sample_pressure_gpa: float, prior_region: GainRegion) -> GainEstimate:
+    def _estimate_adaptive_local(
+        self,
+        sample_pressure_gpa: float,
+        forward_sample_step_gpa: float,
+    ) -> GainEstimate:
+        candidates = [
+            (step_id, pressure, gain)
+            for step_id, pressure, gain in self._local_observations
+            if abs(sample_pressure_gpa - pressure)
+            <= self._cfg.local_pressure_window_gpa
+        ]
+        candidates = candidates[-self._cfg.local_max_observations :]
+        if not candidates:
+            estimate = GainEstimate(
+                safe_gain=0.0,
+                estimated_gain=0.0,
+                gain_uncertainty=0.0,
+                source="probe",
+                n_samples=0,
+                rate_limit_gain=0.0,
+                rate_gain_source="none",
+            )
+            return self._with_rate_limit(estimate, sample_pressure_gpa, 0.0)
+
+        gains = [gain for _, _, gain in candidates]
+        median_gain = statistics.median(gains)
+        upper = max(gains)
+        spread = statistics.pstdev(gains) if len(gains) >= 2 else 0.0
+        uncertainty = max(spread, upper - median_gain, 0.0)
+
+        trend = 0.0
+        ordered = sorted(candidates, key=lambda item: (item[1], item[0]))
+        for (_, p0, g0), (_, p1, g1) in zip(ordered, ordered[1:]):
+            dp = p1 - p0
+            if dp > 0:
+                trend = max(trend, (g1 - g0) / dp)
+        trend = max(trend, 0.0)
+
+        latest_gain = candidates[-1][2]
+        local_upper = max(
+            latest_gain,
+            upper,
+            median_gain
+            + self._cfg.local_uncertainty_safety_factor * uncertainty,
+        )
+        safe_gain = (
+            local_upper * self._cfg.local_gain_safety_factor
+            + self._cfg.local_curvature_safety_factor
+            * trend
+            * max(forward_sample_step_gpa, 0.0)
+        )
+        estimate = GainEstimate(
+            safe_gain=safe_gain,
+            estimated_gain=latest_gain,
+            gain_uncertainty=uncertainty,
+            source="observed",
+            n_samples=len(candidates),
+            rate_limit_gain=safe_gain,
+            rate_gain_source="settled",
+            local_gain_trend_per_gpa=trend,
+        )
+        return self._with_rate_limit(estimate, sample_pressure_gpa, 0.0)
+
+    def estimate(
+        self,
+        sample_pressure_gpa: float,
+        prior_region: GainRegion,
+        *,
+        forward_sample_step_gpa: float = 0.0,
+    ) -> GainEstimate:
+        if self._cfg.step_sizing_mode == "adaptive_local":
+            return self._estimate_adaptive_local(
+                sample_pressure_gpa,
+                forward_sample_step_gpa,
+            )
+
         # Floor for the dynamic gas-side rate cap (see GainRegion.rate_limit_gain's
         # docstring): independent of, and never lower than, whatever safe_gain
         # this call ends up returning below -- guards the case a configured

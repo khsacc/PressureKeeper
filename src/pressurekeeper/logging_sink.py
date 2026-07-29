@@ -89,6 +89,8 @@ _COMMAND_FIELDS = [
     "sample_pressure_before", "filtered_pressure_gpa", "sizing_pressure_gpa", "pressure_slope_gpa_s",
     "predicted_pressure_gpa", "control_target_gpa", "predicted_error_gpa",
     "gain_source", "estimated_gain", "gain_uncertainty", "safe_gain", "rate_limit_gain",
+    "local_gain_trend_per_gpa", "step_sizing_mode", "adaptive_probe",
+    "adaptive_probe_max_expected_gain", "probe_target_cap_mpa",
     "rate_gain_source", "interrupted_rate_observation_count", "learned_rate_floor",
     "requested_sample_step_gpa", "region_min_gpa", "region_max_gpa",
     "source_pressure_positive_mpa", "staged_in_measure",
@@ -97,8 +99,10 @@ _COMMAND_FIELDS = [
 _STEP_FIELDS = [
     "t_mono", "t_wall", "step_id", "t_command", "t_drive_started",
     "membrane_pressure_before", "membrane_pressure_after",
+    "membrane_actual_before", "membrane_actual_after",
     "sample_pressure_before", "sample_pressure_after",
-    "response_time_s", "max_slope_gpa_s", "measurement_std_gpa", "observed_gain",
+    "response_time_s", "max_slope_gpa_s", "measurement_std_gpa",
+    "response_detection_threshold_gpa", "response_detected", "observed_gain",
 ]
 
 _INTERRUPTED_STEP_FIELDS = [
@@ -132,7 +136,7 @@ class DataLogger:
             "pid": os.getpid(),
             "git_sha": _git_sha(),
             "mode": mode,
-            "log_schema_version": 2,
+            "log_schema_version": 3,
             "started_at_wall": time.time(),
             "started_control": False,
             "ended_at_wall": None,
@@ -258,6 +262,13 @@ class DataLogger:
             "gain_uncertainty": d.get("gain_uncertainty"),
             "safe_gain": d.get("safe_gain"),
             "rate_limit_gain": d.get("rate_limit_gain"),
+            "local_gain_trend_per_gpa": d.get("local_gain_trend_per_gpa"),
+            "step_sizing_mode": d.get("step_sizing_mode"),
+            "adaptive_probe": d.get("adaptive_probe"),
+            "adaptive_probe_max_expected_gain": d.get(
+                "adaptive_probe_max_expected_gain"
+            ),
+            "probe_target_cap_mpa": d.get("probe_target_cap_mpa"),
             "rate_gain_source": d.get("rate_gain_source"),
             "interrupted_rate_observation_count": d.get(
                 "interrupted_rate_observation_count"
@@ -278,11 +289,17 @@ class DataLogger:
             "t_drive_started": step.t_drive_started,
             "membrane_pressure_before": step.membrane_pressure_before,
             "membrane_pressure_after": step.membrane_pressure_after,
+            "membrane_actual_before": step.membrane_actual_before,
+            "membrane_actual_after": step.membrane_actual_after,
             "sample_pressure_before": step.sample_pressure_before,
             "sample_pressure_after": step.sample_pressure_after,
             "response_time_s": step.response_time_s,
             "max_slope_gpa_s": step.max_slope_gpa_s,
             "measurement_std_gpa": step.measurement_std_gpa,
+            "response_detection_threshold_gpa": (
+                step.response_detection_threshold_gpa
+            ),
+            "response_detected": step.response_detected,
             "observed_gain": step.observed_gain,
         })
         self._maybe_flush()

@@ -353,6 +353,11 @@ class _GainEstimationEstimatorTab(QWidget):
         form = QFormLayout(self)
 
         form.addRow(QLabel("--- gain_estimation ---"))
+        self.step_sizing_mode = _combo(
+            ["legacy_regions", "adaptive_local"],
+            gain_estimation.step_sizing_mode,
+        )
+        form.addRow("step_sizing_mode:", self.step_sizing_mode)
         self.bin_width_gpa = _line(gain_estimation.bin_width_gpa)
         form.addRow("bin_width_gpa:", self.bin_width_gpa)
         self.min_samples_for_estimate = _line(gain_estimation.min_samples_for_estimate)
@@ -363,6 +368,75 @@ class _GainEstimationEstimatorTab(QWidget):
         form.addRow("upper_percentile (50-100):", self.upper_percentile)
         self.neighbor_bins = _line(gain_estimation.neighbor_bins)
         form.addRow("neighbor_bins:", self.neighbor_bins)
+        self.local_pressure_window_gpa = _line(gain_estimation.local_pressure_window_gpa)
+        form.addRow("local_pressure_window_gpa:", self.local_pressure_window_gpa)
+        self.local_max_observations = _line(gain_estimation.local_max_observations)
+        form.addRow("local_max_observations:", self.local_max_observations)
+        self.local_gain_safety_factor = _line(gain_estimation.local_gain_safety_factor)
+        form.addRow("local_gain_safety_factor:", self.local_gain_safety_factor)
+        self.local_uncertainty_safety_factor = _line(
+            gain_estimation.local_uncertainty_safety_factor
+        )
+        form.addRow(
+            "local_uncertainty_safety_factor:",
+            self.local_uncertainty_safety_factor,
+        )
+        self.local_curvature_safety_factor = _line(gain_estimation.local_curvature_safety_factor)
+        form.addRow("local_curvature_safety_factor:", self.local_curvature_safety_factor)
+        self.response_detection_sigma = _line(gain_estimation.response_detection_sigma)
+        form.addRow("response_detection_sigma:", self.response_detection_sigma)
+        self.response_detection_floor_gpa = _line(gain_estimation.response_detection_floor_gpa)
+        form.addRow("response_detection_floor_gpa:", self.response_detection_floor_gpa)
+        self.initial_probe_step_mpa = _line(gain_estimation.initial_probe_step_mpa)
+        form.addRow("initial_probe_step_mpa:", self.initial_probe_step_mpa)
+        self.probe_growth_factor = _line(gain_estimation.probe_growth_factor)
+        form.addRow("probe_growth_factor:", self.probe_growth_factor)
+        self.max_probe_step_mpa = _line(gain_estimation.max_probe_step_mpa)
+        form.addRow("max_probe_step_mpa:", self.max_probe_step_mpa)
+        self.adaptive_probe_max_expected_gain = _line(
+            gain_estimation.adaptive_probe_max_expected_gain
+        )
+        form.addRow(
+            "adaptive_probe_max_expected_gain:",
+            self.adaptive_probe_max_expected_gain,
+        )
+        self.adaptive_no_response_wait_s = _line(
+            gain_estimation.adaptive_no_response_wait_s
+        )
+        form.addRow(
+            "adaptive_no_response_wait_s:",
+            self.adaptive_no_response_wait_s,
+        )
+        self.max_step_growth_factor = _line(gain_estimation.max_step_growth_factor)
+        form.addRow("max_step_growth_factor:", self.max_step_growth_factor)
+        self.rate_exceeded_step_backoff_factor = _line(
+            gain_estimation.rate_exceeded_step_backoff_factor
+        )
+        form.addRow(
+            "rate_exceeded_step_backoff_factor:",
+            self.rate_exceeded_step_backoff_factor,
+        )
+        self.probe_rate_mpa_per_min = _line(gain_estimation.probe_rate_mpa_per_min)
+        form.addRow("probe_rate_mpa_per_min:", self.probe_rate_mpa_per_min)
+        self.adaptive_max_sample_step_gpa = _line(
+            gain_estimation.adaptive_max_sample_step_gpa
+        )
+        form.addRow("adaptive_max_sample_step_gpa:", self.adaptive_max_sample_step_gpa)
+        self.adaptive_max_membrane_step_mpa = _line(
+            gain_estimation.adaptive_max_membrane_step_mpa
+        )
+        form.addRow("adaptive_max_membrane_step_mpa:", self.adaptive_max_membrane_step_mpa)
+        self.adaptive_minimum_settle_time_s = _line(
+            gain_estimation.adaptive_minimum_settle_time_s
+        )
+        form.addRow("adaptive_minimum_settle_time_s:", self.adaptive_minimum_settle_time_s)
+        self.adaptive_settled_slope_threshold_gpa_s = _line(
+            gain_estimation.adaptive_settled_slope_threshold_gpa_s
+        )
+        form.addRow(
+            "adaptive_settled_slope_threshold_gpa_s:",
+            self.adaptive_settled_slope_threshold_gpa_s,
+        )
         self.interrupted_rate_learning_mode = _combo(
             ["off", "observe", "enforce"],
             gain_estimation.interrupted_rate_learning_mode,
@@ -405,11 +479,88 @@ class _GainEstimationEstimatorTab(QWidget):
     def values(self) -> dict:
         return {
             "gain_estimation": {
+                "step_sizing_mode": self.step_sizing_mode.currentText(),
                 "bin_width_gpa": _req_float(self.bin_width_gpa, "gain_estimation.bin_width_gpa"),
                 "min_samples_for_estimate": _req_int(self.min_samples_for_estimate, "gain_estimation.min_samples_for_estimate"),
                 "safety_factor": _req_float(self.safety_factor, "gain_estimation.safety_factor"),
                 "upper_percentile": _req_float(self.upper_percentile, "gain_estimation.upper_percentile"),
                 "neighbor_bins": _req_int(self.neighbor_bins, "gain_estimation.neighbor_bins"),
+                "local_pressure_window_gpa": _req_float(
+                    self.local_pressure_window_gpa,
+                    "gain_estimation.local_pressure_window_gpa",
+                ),
+                "local_max_observations": _req_int(
+                    self.local_max_observations,
+                    "gain_estimation.local_max_observations",
+                ),
+                "local_gain_safety_factor": _req_float(
+                    self.local_gain_safety_factor,
+                    "gain_estimation.local_gain_safety_factor",
+                ),
+                "local_uncertainty_safety_factor": _req_float(
+                    self.local_uncertainty_safety_factor,
+                    "gain_estimation.local_uncertainty_safety_factor",
+                ),
+                "local_curvature_safety_factor": _req_float(
+                    self.local_curvature_safety_factor,
+                    "gain_estimation.local_curvature_safety_factor",
+                ),
+                "response_detection_sigma": _req_float(
+                    self.response_detection_sigma,
+                    "gain_estimation.response_detection_sigma",
+                ),
+                "response_detection_floor_gpa": _req_float(
+                    self.response_detection_floor_gpa,
+                    "gain_estimation.response_detection_floor_gpa",
+                ),
+                "initial_probe_step_mpa": _req_float(
+                    self.initial_probe_step_mpa,
+                    "gain_estimation.initial_probe_step_mpa",
+                ),
+                "probe_growth_factor": _req_float(
+                    self.probe_growth_factor,
+                    "gain_estimation.probe_growth_factor",
+                ),
+                "max_probe_step_mpa": _req_float(
+                    self.max_probe_step_mpa,
+                    "gain_estimation.max_probe_step_mpa",
+                ),
+                "adaptive_probe_max_expected_gain": _req_float(
+                    self.adaptive_probe_max_expected_gain,
+                    "gain_estimation.adaptive_probe_max_expected_gain",
+                ),
+                "adaptive_no_response_wait_s": _req_float(
+                    self.adaptive_no_response_wait_s,
+                    "gain_estimation.adaptive_no_response_wait_s",
+                ),
+                "max_step_growth_factor": _req_float(
+                    self.max_step_growth_factor,
+                    "gain_estimation.max_step_growth_factor",
+                ),
+                "rate_exceeded_step_backoff_factor": _req_float(
+                    self.rate_exceeded_step_backoff_factor,
+                    "gain_estimation.rate_exceeded_step_backoff_factor",
+                ),
+                "probe_rate_mpa_per_min": _req_float(
+                    self.probe_rate_mpa_per_min,
+                    "gain_estimation.probe_rate_mpa_per_min",
+                ),
+                "adaptive_max_sample_step_gpa": _req_float(
+                    self.adaptive_max_sample_step_gpa,
+                    "gain_estimation.adaptive_max_sample_step_gpa",
+                ),
+                "adaptive_max_membrane_step_mpa": _req_float(
+                    self.adaptive_max_membrane_step_mpa,
+                    "gain_estimation.adaptive_max_membrane_step_mpa",
+                ),
+                "adaptive_minimum_settle_time_s": _req_float(
+                    self.adaptive_minimum_settle_time_s,
+                    "gain_estimation.adaptive_minimum_settle_time_s",
+                ),
+                "adaptive_settled_slope_threshold_gpa_s": _req_float(
+                    self.adaptive_settled_slope_threshold_gpa_s,
+                    "gain_estimation.adaptive_settled_slope_threshold_gpa_s",
+                ),
                 "interrupted_rate_learning_mode": self.interrupted_rate_learning_mode.currentText(),
                 "interrupted_rate_safety_factor": _req_float(
                     self.interrupted_rate_safety_factor,

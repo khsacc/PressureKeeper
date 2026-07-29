@@ -202,3 +202,78 @@ def test_interrupted_rate_observation_updates_in_place_propagates_upward_and_can
     discarded = est.estimate(0.3, region)
     assert discarded.interrupted_rate_observation_count == 0
     assert discarded.rate_limit_gain == region.safe_gain
+
+
+def test_adaptive_local_starts_in_probe_mode_then_uses_first_settled_response():
+    est = GainEstimator(GainEstimationConfig(
+        step_sizing_mode="adaptive_local",
+        local_pressure_window_gpa=0.25,
+        local_max_observations=5,
+        local_gain_safety_factor=1.25,
+    ))
+    region = make_region(safe_gain=99.0)
+
+    initial = est.estimate(0.2, region, forward_sample_step_gpa=0.03)
+    assert initial.source == "probe"
+    assert initial.safe_gain == 0.0
+
+    step = settled_step(1, 1.0, 1.2, 0.20, 0.24)
+    step.membrane_actual_before = 1.0
+    step.membrane_actual_after = 1.2
+    step.response_detected = True
+    est.record_step(step)
+
+    learned = est.estimate(0.24, region, forward_sample_step_gpa=0.03)
+    assert learned.source == "observed"
+    assert learned.n_samples == 1
+    assert abs(learned.estimated_gain - 0.20) < 1e-9
+    assert learned.safe_gain >= 0.25 - 1e-12
+    assert learned.safe_gain < region.safe_gain, \
+        "adaptive mode must not be floored by the legacy region calibration"
+
+
+def test_adaptive_local_does_not_reuse_distant_low_pressure_gain():
+    est = GainEstimator(GainEstimationConfig(
+        step_sizing_mode="adaptive_local",
+        local_pressure_window_gpa=0.1,
+    ))
+    region = make_region()
+    step = settled_step(1, 1.0, 1.2, 0.10, 0.14)
+    step.response_detected = True
+    est.record_step(step)
+
+    assert est.estimate(0.15, region).source == "observed"
+    assert est.estimate(0.50, region).source == "probe"
+
+
+def test_adaptive_local_adds_positive_curvature_allowance():
+    cfg = GainEstimationConfig(
+        step_sizing_mode="adaptive_local",
+        local_pressure_window_gpa=1.0,
+        local_gain_safety_factor=1.0,
+        local_curvature_safety_factor=1.0,
+    )
+    est = GainEstimator(cfg)
+    region = make_region()
+    first = settled_step(1, 1.0, 1.2, 0.10, 0.14)  # gain 0.2
+    first.response_detected = True
+    second = settled_step(2, 1.2, 1.4, 0.14, 0.22)  # gain 0.4
+    second.response_detected = True
+    est.record_step(first)
+    est.record_step(second)
+
+    no_forward = est.estimate(0.22, region, forward_sample_step_gpa=0.0)
+    forward = est.estimate(0.22, region, forward_sample_step_gpa=0.05)
+    assert forward.local_gain_trend_per_gpa > 0
+    assert forward.safe_gain > no_forward.safe_gain
+
+
+def test_step_observed_gain_prefers_actual_gas_delta_and_censors_no_response():
+    step = settled_step(1, 1.0, 2.0, 0.1, 0.3)
+    step.membrane_actual_before = 1.0
+    step.membrane_actual_after = 1.5
+    step.response_detected = True
+    assert abs(step.observed_gain - 0.4) < 1e-9
+
+    step.response_detected = False
+    assert step.observed_gain is None

@@ -31,8 +31,11 @@ def test_default_yaml_loads_cleanly():
     assert config.ruby_api.acquisition.configuration_id is None
     assert config.ruby_api.acquisition.axis_mode is None
     assert config.approach.max_compression_rate_gpa_per_min == 0.5
-    assert config.gain_estimation.interrupted_rate_learning_mode == "observe"
+    assert config.gain_estimation.step_sizing_mode == "adaptive_local"
+    assert config.gain_estimation.interrupted_rate_learning_mode == "enforce"
     assert config.gain_estimation.interrupted_rate_safety_factor == 1.25
+    assert config.gain_estimation.adaptive_probe_max_expected_gain == 5.0
+    assert config.gain_estimation.adaptive_no_response_wait_s == 30.0
     assert config.safety.setpoint_mismatch_grace_s == 0.0
     # Never a real secret committed to git (see CLAUDE.md); --sim needs no
     # config at all, so this is a harmless literal placeholder rather than
@@ -47,6 +50,22 @@ def test_interrupted_rate_learning_config_rejects_unsafe_or_unknown_values():
         GainEstimationConfig(interrupted_rate_learning_mode="automatic")
     with pytest.raises(ValidationError):
         GainEstimationConfig(interrupted_rate_safety_factor=0.99)
+
+
+def test_adaptive_probe_configuration_is_self_consistent(tmp_path):
+    from tests.helpers import make_config
+
+    base = make_config(tmp_path)
+    with pytest.raises(ValidationError, match="initial_probe_step_mpa"):
+        type(base).model_validate({
+            **base.model_dump(),
+            "gain_estimation": {
+                **base.gain_estimation.model_dump(),
+                "step_sizing_mode": "adaptive_local",
+                "initial_probe_step_mpa": 0.3,
+                "max_probe_step_mpa": 0.2,
+            },
+        })
 
 
 def test_env_var_placeholder_is_expanded(tmp_path, monkeypatch):
