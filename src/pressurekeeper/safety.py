@@ -65,10 +65,11 @@ class SafetySupervisor:
     def update_config(self, config: SafetyConfig, start_t: float) -> None:
         """Hot-swap the config, resetting all tracked state (manual
         pause/abort flags, comm-error streaks, cumulative-step window, etc.)
-        as if freshly constructed. Only safe to call before the control loop
-        has started ticking -- see gui/parameters_config_dialog.py, gated to
-        before Start Control -- since this discards the abort/pause latch
-        along with everything else.
+        as if freshly constructed. Only safe to call while stopped -- see
+        gui/main_window.py, gated to before the first Start Control or after
+        Stop Control -- since this discards the abort/pause latch along with
+        everything else, and nothing should be relying on that latch while
+        the membrane isn't being driven.
         """
         self.__init__(config, start_t)
 

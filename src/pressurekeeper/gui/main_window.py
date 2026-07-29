@@ -94,11 +94,14 @@ class MainWindow(QMainWindow):
         self._config_path = config_path
         self._last_params_save_path: Path | None = None
 
+        # --sim mode: ctx.ruby/ctx.membrane are simulator objects with no
+        # host/port/key to configure. Whether Configure API can ever be
+        # enabled at all (independent of the run/stop toggling below, in
+        # _on_start_clicked/_on_stop_clicked).
+        self._configure_api_available = isinstance(ctx.ruby, RubyPressureClient) and isinstance(ctx.membrane, Pace5000Client)
         self.configure_api_action = self.menuBar().addAction("Configure API")
         self.configure_api_action.triggered.connect(self._on_configure_api)
-        if not (isinstance(ctx.ruby, RubyPressureClient) and isinstance(ctx.membrane, Pace5000Client)):
-            # --sim mode: ctx.ruby/ctx.membrane are simulator objects with no
-            # host/port/key to configure.
+        if not self._configure_api_available:
             self.configure_api_action.setEnabled(False)
             self.configure_api_action.setToolTip("Not available in simulator mode")
 
@@ -131,17 +134,16 @@ class MainWindow(QMainWindow):
         self.start_btn.setStyleSheet("background-color:#22c55e; color:white; font-weight:bold;")
         self.start_btn.clicked.connect(self._on_start_clicked)
 
-        self.pause_btn = QPushButton("Pause")
-        self.pause_btn.clicked.connect(lambda: self._controller.pause("operator GUI pause"))
-        self.resume_btn = QPushButton("Resume")
-        self.resume_btn.clicked.connect(self._controller.resume)
-        self.abort_btn = QPushButton("ABORT")
-        self.abort_btn.setStyleSheet("background-color:#ef4444; color:white; font-weight:bold;")
-        self.abort_btn.clicked.connect(lambda: self._controller.abort("operator GUI abort"))
-        self.reset_btn = QPushButton("Reset")
-        self.reset_btn.clicked.connect(self._controller.reset)
-        for w in (self.pause_btn, self.resume_btn, self.abort_btn, self.reset_btn):
-            w.setEnabled(False)
+        self.stop_btn = QPushButton("Stop Control")
+        self.stop_btn.setStyleSheet("background-color:#ef4444; color:white; font-weight:bold;")
+        self.stop_btn.clicked.connect(self._on_stop_clicked)
+        self.stop_btn.setEnabled(False)
+
+        # Set once worker.start() has actually been called, so a later Start
+        # Control click (after Stop Control) knows to just clear the sticky
+        # abort latch (see _on_start_clicked) instead of starting the
+        # ControllerWorker QThread a second time.
+        self._control_started = False
 
         initial_status = 'not started — press "Start Control" to begin the control loop'
         if self._controller.logging_error:
@@ -150,7 +152,7 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
 
         controls_row = QHBoxLayout()
-        for w in (self.start_btn, self.pause_btn, self.resume_btn, self.abort_btn, self.reset_btn):
+        for w in (self.start_btn, self.stop_btn):
             controls_row.addWidget(w)
         controls_row.addWidget(self.status_label, 1)
 
@@ -175,10 +177,20 @@ class MainWindow(QMainWindow):
         # Not started here — see _on_start_clicked.
 
     def _on_start_clicked(self) -> None:
+        if self._control_started:
+            # Restarting after Stop Control: the ControllerWorker QThread
+            # never stopped (it keeps polling/logging through a stopped
+            # controller so status/plot stay live), only the sticky abort
+            # latch set by _on_stop_clicked needs clearing.
+            self._controller.reset()
+        else:
+            self._control_started = True
+            if self._ctx.logger is not None:
+                self._ctx.logger.mark_control_started()
+            self.worker.start()
         self.start_btn.setEnabled(False)
         self.start_btn.setText("Running")
-        for w in (self.pause_btn, self.resume_btn, self.abort_btn, self.reset_btn):
-            w.setEnabled(True)
+        self.stop_btn.setEnabled(True)
         # Repointing a client at a different device mid-control would do so
         # without the safety supervisor ever having characterized it.
         self.configure_api_action.setEnabled(False)
@@ -187,9 +199,23 @@ class MainWindow(QMainWindow):
         # in-progress run.
         self.configure_parameters_action.setEnabled(False)
         self.status_label.setText("control loop starting...")
-        if self._ctx.logger is not None:
-            self._ctx.logger.mark_control_started()
-        self.worker.start()
+
+    def _on_stop_clicked(self) -> None:
+        # Immediately halts pressurization (sticky abort latch -- see
+        # controller.abort()/safety.py's module docstring). The worker
+        # thread is deliberately left running: it keeps polling/logging so
+        # the plot and status line stay live while stopped, and Start
+        # Control simply clears the latch again (see _on_start_clicked)
+        # rather than restarting the thread.
+        self._controller.abort("operator requested stop")
+        self.start_btn.setEnabled(True)
+        self.start_btn.setText("Start Control")
+        self.stop_btn.setEnabled(False)
+        # Nothing is actively controlling the membrane while stopped, so
+        # it's safe to repoint clients or hot-swap config again.
+        if self._configure_api_available:
+            self.configure_api_action.setEnabled(True)
+        self.configure_parameters_action.setEnabled(True)
 
     def _on_configure_api(self) -> None:
         dialog = ApiConfigDialog(self._ctx.ruby, self._ctx.membrane, parent=self)
@@ -254,7 +280,7 @@ class MainWindow(QMainWindow):
         # _LoggingControlTab's docstring) -- new_config.control.dry_run is
         # therefore always identical to self._current_config.control.dry_run,
         # so there is nothing to confirm here.
-        is_real_devices = isinstance(self._ctx.ruby, RubyPressureClient) and isinstance(self._ctx.membrane, Pace5000Client)
+        is_real_devices = self._configure_api_available
 
         chosen_path = self._prompt_params_save_path()
         if chosen_path is None:

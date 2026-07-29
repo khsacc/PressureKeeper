@@ -148,11 +148,14 @@ class OneSidedPressureController:
         the ruby/membrane clients, the logger, or restarting the process.
 
         Only meant to be called from the GUI's "Configure Parameters" dialog
-        (see gui/parameters_config_dialog.py), and only before Start Control:
-        `estimator`/`gain_estimator`/`safety` are reset to their fresh-
-        construction state (see their own `update_config()`), which would
-        corrupt an in-progress run's buffered history, gain observations, and
-        pause/abort latch. Does not touch `self.user_target_gpa` -- an
+        (see gui/parameters_config_dialog.py), and only while stopped (before
+        the first Start Control, or after Stop Control): `estimator`/
+        `gain_estimator`/`safety` are reset to their fresh-construction state
+        (see their own `update_config()`), which would corrupt an in-progress
+        run's buffered history, gain observations, and pause/abort latch --
+        harmless while stopped since nothing is driving the membrane and the
+        abort latch this clears is exactly the one Stop Control itself just
+        set. Does not touch `self.user_target_gpa` -- an
         operator-entered target (e.g. via the Single Target tab) must not be
         silently overwritten by config.control.default_target_pressure_gpa.
         A lowered `config.safety.max_sample_pressure_gpa` still takes effect

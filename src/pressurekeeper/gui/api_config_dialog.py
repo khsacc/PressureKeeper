@@ -12,9 +12,9 @@ values are untouched. All the policy lives in main_window.py's
 specifically -- re-acquiring the single-instance lock against the new
 endpoint before switching (see instance_lock.py) so a changed connection is
 still guarded against a second process. MainWindow only offers this dialog
-before "Start Control" has been pressed -- swapping endpoints mid-control
-would point the safety-checked loop at a different physical device without
-warning.
+while stopped (before the first "Start Control", or after "Stop Control") --
+swapping endpoints mid-control would point the safety-checked loop at a
+different physical device without warning.
 """
 from __future__ import annotations
 

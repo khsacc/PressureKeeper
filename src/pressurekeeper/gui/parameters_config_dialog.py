@@ -5,14 +5,14 @@ sections' non-connection fields) from the GUI instead of hand-editing YAML.
 
 Deliberately excludes ruby_api/pace5000_api's base_url/api_key -- those stay
 in ApiConfigDialog ("Configure API") to avoid two widgets fighting over the
-same value. Like ApiConfigDialog, MainWindow only offers this dialog before
-"Start Control" has been pressed: "Save & Apply" both writes the edited
-values to a new local YAML file (never config/default.yaml -- see
-main_window.py's save guard) and hot-swaps them into the running
-estimator/gain_estimator/safety/controller (see
+same value. Like ApiConfigDialog, MainWindow only offers this dialog while
+stopped (before the first "Start Control", or after "Stop Control"): "Save &
+Apply" both writes the edited values to a new local YAML file (never
+config/default.yaml -- see main_window.py's save guard) and hot-swaps them
+into the running estimator/gain_estimator/safety/controller (see
 OneSidedPressureController.apply_config_update()), which resets buffered
-history/observations/latched flags -- safe only because nothing has ticked
-yet.
+history/observations/latched flags -- safe only while stopped, since nothing
+is being driven and there's no in-progress run for the reset to corrupt.
 
 This module only collects and validates form input (`collect_overlay()`
 returns a dict overlay, raising ValueError on unparseable text); all the
